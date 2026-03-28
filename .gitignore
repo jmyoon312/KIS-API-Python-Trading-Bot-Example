@@ -1,0 +1,24 @@
+# Secrets & Environments
+.env
+*_실전투자.env
+실전투자.env
+keys.json
+accounts.json
+token*.dat
+chat_id.dat
+
+# Data & Logs
+data/
+logs/
+*.log
+*.sqlite
+__pycache__/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+.DS_Store
+
+# IDEs
+.vscode/
+.idea/
