@@ -1,75 +1,84 @@
 # 🚀 Infinity Quant Hub [V23.5]
 
-**Infinity Quant Hub**는 한국투자증권(KIS) Open API를 기반으로 한 프리미엄 미국 주식 자동매매 솔루션입니다. 단순한 거래 도구를 넘어, 리액트 기반의 스마트 대시보드와 자가 치유(Self-Healing) 엔진을 결합하여 프로페셔널한 트레이딩 경험을 제공합니다.
+**Infinity Quant Hub**는 한국투자증권(KIS) Open API를 기반으로 한 프리미엄 미국 주식 자동매매 솔루션입니다. 실전 투자와 모의 투자를 동시에 병렬 구동하는 **듀얼 코어 하이브리드 아키텍처**를 통해 안정적이고 스마트한 자산 관리를 실현합니다.
+
+---
+
+## 🏗️ 듀얼 코어 하이브리드 아키텍처 (Dual-Core Architecture)
+
+본 시스템은 실전 투자(Real)와 모의 투자(Mock) 모드를 동시에 독립적으로 가동할 수 있는 설계를 갖추고 있습니다.
+
+- **독립적 엔진 가동**: 하나의 `main.py` 실행으로 실전과 모의 엔진이 각각의 프로세스에서 병렬로 동작합니다.
+- **데이터 격리**: `data/real` 폴더와 `data/mock` 폴더로 데이터베이스가 엄격히 분리되어 상호 간섭이 없습니다.
+- **듀얼 관제**: 각 모드별로 전용 텔레그램 봇을 연결하여, 실전 계좌와 모의 계좌를 개별적으로 제어하고 알림을 수신할 수 있습니다.
 
 ---
 
 ## ✨ 핵심 기술적 특징 (Key Features)
 
-### 🖥️ 프리미엄 웹 대시보드 (Premium Web Dashboard)
-- **상황실(Control Unit)**: React + Vite + Tailwind CSS 기반의 세련된 UI로 실시간 체결 현황, 포트폴리오 비중, 마켓 타임라인을 한눈에 관제합니다.
-*   **PWA 지원**: 모바일에서도 앱처럼 설치하여 언제 어디서든 서버를 제어할 수 있습니다.
+### 🖥️ 프리미엄 웹 대시보드 (Unified Dashboard)
+- **통합 상황실**: 실전/모의 투자의 실시간 현황을 단하나의 웹 인터페이스에서 통합 관제합니다.
+- **사이클 분석(V23.5)**: 단순히 거래를 나열하는 것이 아니라, '매수부터 졸업까지'의 전체 주기를 데이터화하여 전략적 성과를 입체적으로 분석합니다.
 
 ### 🛡️ 불독 엔진 (Bulldog Retry Engine)
-- **장애 극복**: KIS API의 일시적 장애(500)나 유량 제한(429) 발생 시, 5단계 지연 재시도 알고리즘을 가동하여 주문 누락을 원천 차단합니다.
-- **자전거래 방어 (Dual Wash-Trade Shield)**: 전략 로직과 브로커 통신 양단에서 의도치 않은 자전거래 실수를 완벽히 방어합니다.
+- **무중단 매매**: API 유량 제한(429)이나 서버 일시 장애(500) 시 5단계 지연 재시도 알고리즘을 통해 주문을 완수합니다.
+- **자전거래 보호**: 전략 및 브로커 레벨에서 의도치 않은 자전거래 실수를 원천 차단합니다.
 
-### 📊 장부 사이클 분석 (Cycle Analytics - V23.5)
-- **입체적 분석**: 거래 하나하나를 넘어, '첫 매수부터 졸업까지'의 전체 주기를 사이클로 정의하여 승률, 평균 보유 기간, 최종 Yield를 정밀하게 분석합니다.
-
-### 🔄 TrueSync & 듀얼 코어 (Dual-Core Sync)
-- **데이터 격리**: 실전 투자와 모의 투자 환경을 완벽히 분리하여 동시에 운용할 수 있습니다.
-- **자동 동기화**: 미국 시장 휴장일과 서머타임(DST)을 자동 감지하며, 실제 잔고와 가상 장부의 1원 단위 오차까지 실시간으로 보정합니다.
+### 🔄 TrueSync 시스템
+- **완벽한 동기화**: 미국 시장 휴장일 자동 인식 및 1원 단위의 잔고-장부 정밀 동기화 기능을 제공합니다.
 
 ---
 
-## 🛠️ 설치 및 실행 방법 (Installation & Usage)
+## 🛠️ 설정 및 실행 방법 (Configuration Guide)
 
-### 1. 필수 환경 (Requirements)
-*   **Python 3.12+** (Backend Engine)
-*   **Node.js 20+** (Frontend Dashboard Build)
-*   **한국투자증권 API Key** (실전/모의 별도)
-*   **Telegram Bot Token & Chat ID**
+### 1. 환경 변수 설정 (.env)
+프로젝트 최상단에 `.env` 파일을 생성하고 아래 양식에 맞춰 정보를 입력합니다. (실전 혹은 모의 중 하나만 가동하려면 해당 섹션만 입력하면 됩니다.)
 
-### 2. 패키지 설치 및 빌드
-```bash
-# 백엔드 의존성 설치
-pip install requests yfinance pytz fastapi uvicorn python-dotenv "python-telegram-bot[job-queue]"
-
-# 프론트엔드 빌드 (선택 사항)
-cd frontend
-npm install
-npm run build
-```
-
-### 3. 환경 변수 설정 (.env)
-프로젝트 최상단 폴더에 `.env` 파일을 생성하고 본인의 키를 입력합니다. (보안을 위해 `.gitignore`에 등록되어 있습니다.)
 ```env
-TELEGRAM_TOKEN=나의_토큰
-ADMIN_CHAT_ID=나의_채팅방ID
-APP_KEY_REAL=실전_APP_KEY
-APP_SECRET_REAL=실전_APP_SECRET
-... (기타 설정)
+# [공통 설정]
+ADMIN_CHAT_ID=나의_텔레그램_채팅방_ID
+
+# [실전 투자 모드 - REAL]
+REAL_TELEGRAM_TOKEN=실전용_봇_토큰
+REAL_APP_KEY=실전_APP_KEY
+REAL_APP_SECRET=실전_APP_SECRET
+REAL_CANO=실전_계좌번호(8자리)
+REAL_ACNT_PRDT_CD=01
+
+# [모의 투자 모드 - MOCK]
+MOCK_TELEGRAM_TOKEN=모의용_봇_토큰
+MOCK_APP_KEY=모의_APP_KEY
+MOCK_APP_SECRET=모의_APP_SECRET
+MOCK_CANO=모의_계좌번호(8자리)
+MOCK_ACNT_PRDT_CD=01
 ```
 
-### 4. 프로그램 실행
+### 2. 프로그램 실행
 ```bash
+# 1. 의존성 설치
+pip install -r requirements.txt (혹은 개별 라이브러리 설치)
+
+# 2. 엔진 가동 (실전/모의 동시 가동)
 python main.py
 ```
 
 ---
 
-## 🚨 원작자 저작권 및 면책 조항
-
-*   **저작권 명시**: 본 프로젝트의 핵심 매매 로직(무한매수법) 아이디어는 원작자 **'라오어'**님에게 있습니다. 본 코드는 기술적 학습 및 데이터 시각화를 위한 자동화 도구일 뿐이며, 원작자의 공식 인증을 받은 프로그램이 아닙니다.
-*   **면책 조항**: 실제 투자에 따른 금전적 손실 책임은 전적으로 사용자 본인에게 있습니다. 반드시 충분한 모의 테스트 후에 운용하십시오.
+## 📂 파일 구조 (File Structure)
+- `data/`: 모든 거래 데이터 및 설정 파일 저장
+  - `real/`: 실전 투자 전용 데이터베이스
+  - `mock/`: 모의 투자 전용 데이터베이스
+- `frontend/`: React 기반 웹 대시보드 소스 코드
+- `main.py`: 통합 스케줄러 및 듀얼 코어 엔진 진입점
+- `broker.py`: KIS API 커넥터 및 불독 엔진 로직
+- `strategy.py`: 무한매수 기반 분할 매수/매도 핵심 전략
+- `web_server.py`: 통합 대시보드 API 및 정적 파일 서버
+- `version_history.py`: 프로젝트 진화 히스토리 관리
 
 ---
 
-## 📂 파일 구조 (Structure)
-- `main.py`: 통합 스케줄러 및 엔진 진입점
-- `broker.py`: KIS API 통신 및 Bulldog 엔진
-- `strategy.py`: 무한매수 기반 분할 매수/매도 로직
-- `web_server.py`: FastAPI 기반 대시보드 API 서버
-- `frontend/`: React + Vite 개발 환경
-- `config.py`: 데이터 영속성 및 사이클 분석 매니저
+## 🚨 면책 조항 (Disclaimer)
+
+*   본 프로그램은 기술적 학습 및 데이터 시각화를 위한 자동화 도구입니다.
+*   **라오어**님의 '무한매수법' 전략을 자동화한 것으로, 모든 투자 책임은 사용자 본인에게 있습니다.
+*   반드시 모의 투자 모드에서 충분한 검증을 거친 후 운용하십시오.
