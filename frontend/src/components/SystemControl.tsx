@@ -170,6 +170,25 @@ export default function SystemControl({ mode }: { mode: 'mock' | 'real' }) {
     }
   }
 
+  // 👤 [V24] Shadow-Strike 설정 업데이트 핸들러
+  const handleShadowToggle = async (ticker: string, currentActive: boolean, bounce: number) => {
+    try {
+      await api.post('/settings/shadow', { mode, ticker, active: !currentActive, bounce })
+      await fetchData() // UI 갱신
+    } catch { setStatusMsg(`❌ [${ticker}] Shadow 모드 변경 실패`) }
+  }
+
+  const handleShadowBounce = async (ticker: string, active: boolean, newBounce: number) => {
+    try {
+      await api.post('/settings/shadow', { mode, ticker, active, bounce: newBounce })
+      // 성능을 위해 local config만 업데이트 (debounce 처리가 좋으나 여기선 단순화)
+      setConfig((prev: any) => ({
+        ...prev,
+        [ticker]: { ...prev[ticker], shadow: { active, bounce: newBounce } }
+      }))
+    } catch { setStatusMsg(`❌ [${ticker}] Bounce 비율 변경 실패`) }
+  }
+
   // 🌐 [V24] 총 자산 실시간 보정 계산 (현금 + ∑(종목별 수량 * 현재가))
   const calculatedHoldingsVal = account?.tickers ? Object.values(account.tickers).reduce((sum: number, t: any) => {
     return sum + (Number(t.qty || 0) * Number(t.current_price || 0))
@@ -183,6 +202,7 @@ export default function SystemControl({ mode }: { mode: 'mock' | 'real' }) {
     version: config?.[t]?.version || 'V22',
     ratio: config?.[t]?.portfolio_ratio || 0,
     holdingQty: account?.tickers?.[t]?.qty || 0,
+    shadow: config?.[t]?.shadow || { active: false, bounce: 1.5 }
   }))
 
   const totalSeed = tickerSeeds.reduce((s: number, ts: any) => s + ts.seed, 0)
@@ -283,12 +303,34 @@ export default function SystemControl({ mode }: { mode: 'mock' | 'real' }) {
           
           <div className="space-y-3">
             {tickerSeeds.map(ts => (
-              <div key={ts.ticker} className="space-y-1">
+              <div key={ts.ticker} className="space-y-1 bg-[#121214] p-3 rounded-xl border border-[#27272a]/40">
                 <div className="flex justify-between items-center text-xs">
-                  <span className="text-gray-100 font-bold flex items-center gap-1">
-                    {ts.ticker}
-                    {ts.holdingQty > 0 && <span className="text-[0.6rem] bg-yellow-500/10 text-yellow-500 px-1 rounded border border-yellow-500/20">{ts.holdingQty}주</span>}
-                  </span>
+                  <div className="flex flex-col">
+                    <span className="text-gray-100 font-bold flex items-center gap-1">
+                      {ts.ticker}
+                      {ts.holdingQty > 0 && <span className="text-[0.6rem] bg-yellow-500/10 text-yellow-500 px-1 rounded border border-yellow-500/20">{ts.holdingQty}주</span>}
+                    </span>
+                    {/* 👤 [V24] Shadow-Strike 제어 유닛 */}
+                    <div className="flex items-center gap-2 mt-1">
+                      <button 
+                        onClick={() => handleShadowToggle(ts.ticker, ts.shadow.active, ts.shadow.bounce)}
+                        className={`text-[0.55rem] px-1.5 py-0.5 rounded transition-all font-bold ${ts.shadow.active ? 'bg-indigo-600 text-white' : 'bg-gray-800 text-gray-500'}`}
+                      >
+                        👤 SHADOW {ts.shadow.active ? 'ON' : 'OFF'}
+                      </button>
+                      {ts.shadow.active && (
+                        <div className="flex items-center gap-1">
+                          <input 
+                            type="range" min="0.5" max="5.0" step="0.1" 
+                            value={ts.shadow.bounce} 
+                            onChange={(e) => handleShadowBounce(ts.ticker, ts.shadow.active, parseFloat(e.target.value))}
+                            className="w-12 h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-indigo-500"
+                          />
+                          <span className="text-[0.55rem] text-indigo-400 font-mono">{ts.shadow.bounce}%</span>
+                        </div>
+                      )}
+                    </div>
+                  </div>
                   <div className="flex items-center gap-2">
                     <span className="text-yellow-500 font-bold tabular-nums text-[0.65rem]">
                       ${Math.round(totalAsset * (localRatios[ts.ticker] || 0)).toLocaleString()}

@@ -31,7 +31,7 @@ class InfiniteStrategy:
             
         return base_qty
 
-    def get_plan(self, ticker, current_price, avg_price, qty, prev_close, ma_5day=0.0, market_type="REG", available_cash=0, is_simulation=False, force_turbo_off=False):
+    def get_plan(self, ticker, current_price, avg_price, qty, prev_close, ma_5day=0.0, day_low=0.0, market_type="REG", available_cash=0, is_simulation=False, force_turbo_off=False):
         core_orders = []
         bonus_orders = []
         smart_core_orders = []   
@@ -215,6 +215,22 @@ class InfiniteStrategy:
             is_turbo_active = False if force_turbo_off else self.cfg.get_turbo_mode()
             
             safe_ceiling = min(avg_price, star_price) if star_price > 0 else avg_price
+
+            # 👤 [V24] Shadow-Strike: 저점 추격 매입 가격 산출
+            is_shadow_active = self.cfg.is_shadow_active(ticker)
+            shadow_bounce = self.cfg.get_shadow_bounce(ticker) / 100.0
+            
+            if is_shadow_active and day_low > 0:
+                # 저점 대비 지정된 % 반등한 가격 (현실적 눌림목)
+                shadow_price = self._floor(day_low * (1 + shadow_bounce))
+                # 평단가보다 높더라도 최대 5% 마진까지는 추격 허용 (MOC 효과 재현)
+                shadow_ceiling = avg_price * 1.05 if avg_price > 0 else current_price * 1.05
+                shadow_buy_price = min(shadow_ceiling, shadow_price)
+                
+                # Shadow가 활성화된 경우 평소보다 높은 가격에서도 LOC 체결 유도
+                if shadow_buy_price > safe_ceiling:
+                    safe_ceiling = shadow_buy_price
+                    process_status = f"👤Shadow({process_status})"
 
             if is_turbo_active and not is_last_lap:
                 if is_simulation or real_available_cash >= one_portion_amt:

@@ -4,6 +4,11 @@
 # ==========================================================
 
 VERSION_HISTORY = [
+    "V24 [2026-03-29] - Shadow-Strike 전략 공식 도입 및 시스템 전방위 고도화",
+    "   └ [Engine] Shadow-Strike: 1.5% Bounce(눌림목) 추격 매수 로직 도입 (수익률 814% 모델)",
+    "   └ [Simulator] High-Fidelity Lab: 시뮬레이터에 실전과 동일한 Shadow 제어 엔진 이식",
+    "   └ [UI] Tactical Control: 상황실 및 시뮬레이터 내 Shadow 모드/Bounce 정밀 설정 기능 추가",
+    "   └ [Compounding] 100% Reinvestment: 수익금 전액 재투자 자동화 (기본값 변경)",
     "V23.5 [2026-03-29] - 장부 사이클 분석(Cycle Analytics) 및 웹 대시보드 강화",
     "   └ [Ledger] Cycle-based Analytics: 매수일부터 졸업일까지를 하나의 사이클로 묶어 수익률/기간 정밀 분석",
     "   └ [UI] Dashboard Premium UI: 리액트 기반의 사이클 카드 및 트레이딩 타임라인 시각화 인터페이스 도입",

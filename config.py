@@ -55,17 +55,19 @@ class ConfigManager:
             "LIVE_STATUS": "live_status.json",
             "ENGINE_STATUS": "engine_status.dat",
             "REFRESH_TRIGGER": "refresh_needed.tmp",
+            "SHADOW_CFG": "shadow_config.json", # 👤 [V24] Shadow-Strike 설정 (ON/OFF, Bounce)
             "EVENT_LOG": "event_log.json"
         }
         
         self.DEFAULT_SEED = {"SOXL": 6720.0, "TQQQ": 6720.0}
         self.DEFAULT_SPLIT = {"SOXL": 40.0, "TQQQ": 40.0}
         self.DEFAULT_TARGET = {"SOXL": 12.0, "TQQQ": 10.0}
-        self.DEFAULT_COMPOUND = {"SOXL": 70.0, "TQQQ": 70.0}
+        self.DEFAULT_COMPOUND = {"SOXL": 100.0, "TQQQ": 100.0}
         self.DEFAULT_VERSION = {"SOXL": "V14", "TQQQ": "V14"}
         self.DEFAULT_PORTFOLIO_RATIO = {"SOXL": 0.55, "TQQQ": 0.45} # 🌟 [V22 패치] 100% 동적분할 기본 타겟 비중 (예비비 0%)
         
         self.DEFAULT_SNIPER_MULTIPLIER = {"SOXL": 1.0, "TQQQ": 0.9}
+        self.DEFAULT_SHADOW_BOUNCE = 1.5 # 🌟 [V24] 기본 반등 비율 (1.5%)
 
     def _get_base_dir(self):
         """🌟 [V22.2] 현재 모드에 따른 전용 데이터 디렉토리 반환"""
@@ -201,6 +203,30 @@ class ConfigManager:
                 if ticker_in_lock != exclude_ticker:
                     total += float(v)
         return total
+
+    # ==========================================================
+    # 👤 [V24] Shadow-Strike 전용 설정 메서드
+    # ==========================================================
+    def get_shadow_config(self, ticker):
+        """Shadow 모드 활성화 여부 및 반등 비율 획득"""
+        cfg = self._load_json("SHADOW_CFG", {})
+        return cfg.get(ticker, {"active": False, "bounce": self.DEFAULT_SHADOW_BOUNCE})
+
+    def set_shadow_config(self, ticker, active, bounce):
+        """Shadow 모드 설정 저장"""
+        cfg = self._load_json("SHADOW_CFG", {})
+        cfg[ticker] = {
+            "active": bool(active),
+            "bounce": float(bounce)
+        }
+        self._save_json("SHADOW_CFG", cfg)
+        self.record_event("STRATEGY", "UPDATE", f"[{ticker}] Shadow-Strike 설정 변경 (Active: {active}, Bounce: {bounce}%)")
+
+    def is_shadow_active(self, ticker):
+        return self.get_shadow_config(ticker).get("active", False)
+
+    def get_shadow_bounce(self, ticker):
+        return self.get_shadow_config(ticker).get("bounce", self.DEFAULT_SHADOW_BOUNCE)
 
     def get_absolute_t_val(self, ticker, actual_qty, actual_avg_price):
         seed = self.get_seed(ticker)

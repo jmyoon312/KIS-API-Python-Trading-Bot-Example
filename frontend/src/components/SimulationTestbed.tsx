@@ -19,9 +19,11 @@ export default function SimulationTestbed() {
   const [split, setSplit] = useState(40)
   const [target, setTarget] = useState(10.0)
   const [version, setVersion] = useState('V24')
+  const [shadowBounce, setShadowBounce] = useState(1.5) // 👤 [V24] Default Shadow Bounce
   
   const [compareMode, setCompareMode] = useState(false)
   const [versionB, setVersionB] = useState('V14')
+  const [shadowBounceB, setShadowBounceB] = useState(1.5)
 
   const [loading, setLoading] = useState(false)
   const [resultA, setResultA] = useState<any>(null)
@@ -34,14 +36,14 @@ export default function SimulationTestbed() {
     try {
       const resA = await axios.post('/api/simulation/run', {
         ticker, start_date: startDate, end_date: endDate,
-        seed, split, target, version
+        seed, split, target, version, shadow_bounce: shadowBounce
       })
       
       let resB = null
       if (compareMode) {
         resB = await axios.post('/api/simulation/run', {
           ticker, start_date: startDate, end_date: endDate,
-          seed, split, target, version: versionB
+          seed, split, target, version: versionB, shadow_bounce: shadowBounceB
         })
       }
 
@@ -167,6 +169,30 @@ export default function SimulationTestbed() {
               <input type="number" value={target} onChange={(e) => setTarget(Number(e.target.value))} className="w-full bg-[#18181b] border border-[#27272a] rounded-xl px-3 py-2 text-sm text-white font-bold outline-none" />
             </div>
           </div>
+
+          {(version === 'V24' || (compareMode && versionB === 'V24')) && (
+            <div className="pt-2 space-y-3 animate-fade-in">
+                <h4 className="text-[9px] font-black text-indigo-400 uppercase tracking-widest border-b border-indigo-900/20 pb-1">👤 Shadow-Strike Settings</h4>
+                <div className="grid grid-cols-2 gap-4">
+                    <div className="space-y-2">
+                        <label className="text-[10px] font-bold text-gray-500">Scenario A Bounce (%)</label>
+                        <div className="flex items-center gap-2">
+                            <input type="range" min="0.5" max="5.0" step="0.1" value={shadowBounce} onChange={(e) => setShadowBounce(parseFloat(e.target.value))} className="flex-1 accent-indigo-500" disabled={version !== 'V24'} />
+                            <span className="text-xs font-mono text-indigo-300 w-8">{shadowBounce}%</span>
+                        </div>
+                    </div>
+                    {compareMode && (
+                        <div className="space-y-2">
+                            <label className="text-[10px] font-bold text-gray-500">Scenario B Bounce (%)</label>
+                            <div className="flex items-center gap-2">
+                                <input type="range" min="0.5" max="5.0" step="0.1" value={shadowBounceB} onChange={(e) => setShadowBounceB(parseFloat(e.target.value))} className="flex-1 accent-orange-500" disabled={versionB !== 'V24'} />
+                                <span className="text-xs font-mono text-orange-300 w-8">{shadowBounceB}%</span>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            </div>
+          )}
 
           <button onClick={runSimulation} disabled={loading} className={`w-full py-4 rounded-2xl flex items-center justify-center gap-2 font-black text-white transition-all shadow-xl active:scale-95 ${loading ? 'bg-purple-900/50' : 'bg-gradient-to-r from-purple-600 to-indigo-600 shadow-purple-900/20'}`}>
             {loading ? <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin"></div> : <><Play className="w-4 h-4 fill-current" /> 분석 가공 (Backtest)</>}

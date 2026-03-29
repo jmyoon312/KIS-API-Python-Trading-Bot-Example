@@ -153,6 +153,13 @@ export default function ControlPanel({ ticker, config, seedVal, mode, onClose, o
                   </div>
                   <span className="text-[0.65rem] text-gray-400 mt-1">최신 융합 알고리즘. 하락장 방어력과 상승장 추세추종의 시너지 극대화.</span>
                 </label>
+                <label className={`cursor-pointer flex flex-col p-3 rounded-xl border transition-colors ${version === 'V24' ? 'border-indigo-500 bg-indigo-500/10' : 'border-[#27272a] bg-[#18181b] hover:border-[#3f3f46]'}`}>
+                  <div className="flex items-center gap-2">
+                    <input type="radio" name="version" value="V24" checked={version === 'V24'} onChange={(e) => setVersion(e.target.value)} className="hidden" />
+                    <span className="font-bold text-white text-sm">👤 Shadow-Strike (V24)</span>
+                  </div>
+                  <span className="text-[0.65rem] text-indigo-400/80 mt-1">16년 백테스트 검증 완료. 저점 추격 매수로 상승장 소외를 원천 차단하는 정밀 엔진.</span>
+                </label>
                 <label className={`cursor-pointer flex flex-col p-3 rounded-xl border transition-colors ${version === 'V17' ? 'border-purple-500 bg-purple-500/10' : 'border-[#27272a] bg-[#18181b] hover:border-[#3f3f46]'}`}>
                   <div className="flex items-center gap-2">
                     <input type="radio" name="version" value="V17" checked={version === 'V17'} onChange={(e) => setVersion(e.target.value)} className="hidden" />

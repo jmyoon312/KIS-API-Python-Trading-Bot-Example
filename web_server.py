@@ -113,6 +113,7 @@ def get_config_api(mode: str = "real"):
             "compound_rate": cfg.get_compound_rate(t),
             "version": cfg.get_version(t),
             "portfolio_ratio": cfg.get_portfolio_ratio(t),
+            "shadow": cfg.get_shadow_config(t) # 👤 [V24] Shadow-Strike 설정 포함
         }
     return {"status": "ok", "config": config, "is_real": cfg.is_real}
 
@@ -346,6 +347,18 @@ def update_portfolio_ratios(req: dict):
     for ticker, val in ratios.items():
         cfg.set_portfolio_ratio(ticker, float(val))
     return {"status": "ok"}
+
+@app.post("/api/settings/shadow")
+def update_shadow_settings(req: dict):
+    """Shadow-Strike (V24) 설정을 업데이트합니다."""
+    mode = req.get("mode", "real")
+    ticker = req.get("ticker")
+    active = req.get("active") == True
+    bounce = float(req.get("bounce", 1.5))
+    
+    cfg = get_cfg(mode)
+    cfg.set_shadow_config(ticker, active, bounce)
+    return {"status": "ok", "ticker": ticker, "active": active, "bounce": bounce}
 
 # --- 신규 액션 API (IPC 통신 브릿지) ---
 @app.post("/api/action/exec")

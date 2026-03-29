@@ -101,19 +101,38 @@ class InfinitySimulator:
                 avg_price = 0.0
                 t_val = 0
             
-            # 4. Standard Buying + V24 Turbo
+            # 4. Standard Buying + V24 Shadow-Strike
             day_buy_amt = one_portion_amt
-            # V24 Turbo: -5% drop from prev close = 1 extra portion
+            
+            # ⚓ Default Safe Ceiling (Standard LOC)
+            safe_ceiling = min(avg_price, star_price) if star_price > 0 else avg_price
+            
+            # 👤 [V24] Shadow-Strike Logic (High Fidelity)
+            if self.version == "V24":
+                day_low = row['Low']
+                # 저점 대비 Bounce % 반등한 가격
+                shadow_price = day_low * (1 + self.shadow_bounce / 100.0)
+                # 평단 + 5% 까지는 공격적 추격 허용
+                shadow_ceiling = avg_price * 1.05 if avg_price > 0 else price * 1.05
+                shadow_buy_price = min(shadow_ceiling, shadow_price)
+                
+                # Shadow 가격이 기존 LOC 천장보다 높다면 상향 조정 (체결 성공률 향상)
+                if shadow_buy_price > safe_ceiling:
+                    safe_ceiling = shadow_buy_price
+
+            # V24 Turbo (Legacy Compat): -5% drop from prev close = 1 extra portion
             if self.version == "V24" and price < (prev_close * 0.95):
                 day_buy_amt += one_portion_amt
             
-            if cash >= day_buy_amt:
-                buy_qty = math.floor(day_buy_amt / price)
-                if buy_qty > 0:
-                    new_total = holdings + buy_qty
-                    avg_price = ((holdings * avg_price) + (buy_qty * price)) / new_total
-                    holdings = new_total
-                    cash -= (buy_qty * price)
+            # 체결 조건: 당일 종가가 Safe Ceiling 이하인 경우 매수 성공으로 간주
+            if price <= safe_ceiling or avg_price == 0:
+                if cash >= day_buy_amt:
+                    buy_qty = math.floor(day_buy_amt / price)
+                    if buy_qty > 0:
+                        new_total = holdings + buy_qty
+                        avg_price = ((holdings * avg_price) + (buy_qty * price)) / new_total
+                        holdings = new_total
+                        cash -= (buy_qty * price)
             
             # 5. Snapshot
             current_total = cash + (holdings * price)

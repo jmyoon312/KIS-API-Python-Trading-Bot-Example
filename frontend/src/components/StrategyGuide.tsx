@@ -92,29 +92,29 @@ export default function StrategyGuide() {
         </div>
       </div>
 
-      {/* 👑 Step 4: The Master Control (V24 Rebalance) */}
-      <div className="bg-[#18181b] rounded-3xl border border-blue-500/40 p-10 shadow-2xl relative overflow-hidden group">
-        <div className="absolute top-0 right-0 p-10 opacity-5 group-hover:opacity-10 transition-opacity">
+      {/* 👑 Step 4: Shadow-Strike (V24 Evolution) */}
+      <div className="bg-[#18181b] rounded-3xl border border-indigo-500/40 p-10 shadow-2xl relative overflow-hidden group">
+        <div className="absolute top-0 right-0 p-10 opacity-5 group-hover:opacity-10 transition-opacity font-serif">
           <span className="text-9xl font-black italic">V24</span>
         </div>
         <div className="flex items-center gap-4 mb-6">
-          <span className="text-4xl font-black text-blue-500/40 tracking-tighter">FINAL</span>
-          <h3 className="text-2xl font-black text-blue-400 tracking-tight">Step 4: 포트폴리오 자산 방어 (The Master)</h3>
+          <span className="text-4xl font-black text-indigo-500/40 tracking-tighter uppercase italic">Next Gen</span>
+          <h3 className="text-2xl font-black text-indigo-400 tracking-tight">Step 4: 섀도우 스트라이크 (Shadow-Strike)</h3>
         </div>
         <p className="text-gray-300 text-sm leading-relaxed mb-8 max-w-4xl">
-          개별 종목의 전략이 아무리 훌륭해도 계좌 전체의 균형이 무너지는 것을 막기 위해 설계된 **V24 스마트 리밸런싱**입니다. 현금과 주식을 하나의 '전략적 유기체'로 관리하여 어떤 상황에서도 계좌의 무결성을 보장합니다.
+          LOC 매매의 물리적 한계를 정밀 데이터 분석으로 극복한 **V24 Shadow-Strike** 엔진입니다. 단순히 종가에 사는 것이 아니라, 장중 저점 대비 **1.5% 반등(Bounce)** 지점을 추적하여 최적의 눌림목에서 공격적으로 물량을 확보합니다.
         </p>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-          <div className="bg-[#121214] p-5 rounded-2xl border border-[#27272a] hover:border-blue-500/20 transition-colors">
-            <h4 className="text-blue-400 font-bold text-xs mb-3 flex items-center gap-2">🛡️ 수동 보정 세이프티 넷</h4>
+          <div className="bg-[#121214] p-5 rounded-2xl border border-[#27272a] hover:border-indigo-500/20 transition-colors">
+            <h4 className="text-indigo-400 font-bold text-xs mb-3 flex items-center gap-2">👤 저점 추격 (Shadow Pricing)</h4>
             <p className="text-[0.7rem] text-gray-500 leading-relaxed italic">
-              "API 오류나 주말 휴장 시 총 평가액이 0으로 나올 경우, 엔진이 즉시 개별 데이터를 직접 합산하여 비정상적 시드 분배를 원천 차단합니다."
+              "평단가보다 조금 비싸더라도, 당일 저점 대비 충분히 눌림목이 형성되었다면 매수를 실행합니다. 이는 상승장에서 체결을 놓치는 기회비용을 80% 이상 회수합니다."
             </p>
           </div>
-          <div className="bg-[#121214] p-5 rounded-2xl border border-[#27272a] hover:border-blue-500/20 transition-colors">
-            <h4 className="text-blue-400 font-bold text-xs mb-3 flex items-center gap-2">🔄 졸업 연동 시드 분배</h4>
+          <div className="bg-[#121214] p-5 rounded-2xl border border-[#27272a] hover:border-indigo-500/20 transition-colors">
+            <h4 className="text-indigo-400 font-bold text-xs mb-3 flex items-center gap-2">⚖️ 스마트 시드 리밸런싱</h4>
             <p className="text-[0.7rem] text-gray-500 leading-relaxed italic">
-              "전략 중단 없이 수익 실현(졸업) 시점에 전체 자산을 재계산하여 타겟 비중대로 시드를 즉시 재배치, 복합 성장을 유도합니다."
+              "전략 중단 없이 수익 실현(졸업) 시점에 전체 자산을 재계산하여 타겟 비중(TQQQ 55: SOXL 45)대로 시드를 즉시 재배치, 복합 성장을 무한히 유도합니다."
             </p>
           </div>
         </div>

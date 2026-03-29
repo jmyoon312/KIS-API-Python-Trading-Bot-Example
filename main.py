@@ -712,7 +712,7 @@ async def scheduled_live_sync(context):
                         # 🧪 [V23.3] 주말/장마감 시에도 '계산용' plan은 생성하여 UI에 전달
                         plan = strategy.get_plan(
                             t, curr_p, float(h['avg']), int(h['qty']), data.get('prev_close', 0), 
-                            ma_5day=data.get('ma_5day', 0), market_type=status_code, 
+                            ma_5day=data.get('ma_5day', 0), day_low=data.get('day_low', 0), market_type=status_code, 
                             available_cash=available_cash_map.get(t, 0), force_turbo_off=force_turbo_off
                         )
                         live_data["tickers"][t].update(plan)
