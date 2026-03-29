@@ -463,7 +463,7 @@ def run_simulation(req: dict):
     version = req.get("version", "V14")
     
     try:
-        sim = InfinitySimulator(ticker, start_date, end_date, seed, split, target, version)
+        sim = InfinitySimulator(ticker, start_date, end_date, seed, split, target, version, shadow_bounce=req.get("shadow_bounce", 1.5))
         result = sim.run()
         return {"status": "ok", "result": result}
     except Exception as e:

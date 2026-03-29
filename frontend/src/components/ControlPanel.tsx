@@ -17,6 +17,8 @@ export default function ControlPanel({ ticker, config, seedVal, mode, onClose, o
   const [compound, setCompound] = useState(config.compound || 70);
   const [version, setVersion] = useState(config.version || "V14");
   const [force, setForce] = useState(false); // 🔥 [V23.1] 즉시 적용 (강제 모드)
+  const [shadowActive, setShadowActive] = useState(config.shadow?.active || false);
+  const [shadowBounce, setShadowBounce] = useState(config.shadow?.bounce || 1.5);
   const [loading, setLoading] = useState(false);
 
   const api = axios.create({ baseURL: '/api' });
@@ -30,6 +32,7 @@ export default function ControlPanel({ ticker, config, seedVal, mode, onClose, o
         api.post('/settings/target', { ticker, value: target, mode }),
         api.post('/settings/compound', { ticker, value: compound, mode }),
         api.post('/settings/version', { ticker, value: version, mode }),
+        api.post('/settings/shadow', { ticker, active: shadowActive, bounce: shadowBounce, mode }),
       ]);
       await api.get(`/refresh?mode=${mode}`); // 트리거 생성
       setTimeout(() => {
@@ -160,6 +163,46 @@ export default function ControlPanel({ ticker, config, seedVal, mode, onClose, o
                   </div>
                   <span className="text-[0.65rem] text-indigo-400/80 mt-1">16년 백테스트 검증 완료. 저점 추격 매수로 상승장 소외를 원천 차단하는 정밀 엔진.</span>
                 </label>
+
+                {/* 👤 [V24] Shadow-Strike 전용 설정 섹션 */}
+                {version === 'V24' && (
+                  <div className="mt-2 p-4 rounded-xl bg-indigo-500/5 border border-indigo-500/20 space-y-3 animate-slide-down">
+                    <div className="flex justify-between items-center">
+                      <label className="text-xs font-bold text-indigo-300 flex items-center gap-1">
+                        👤 Shadow 모드 활성화
+                      </label>
+                      <button 
+                        onClick={() => setShadowActive(!shadowActive)}
+                        className={`w-10 h-5 rounded-full transition-colors relative ${shadowActive ? 'bg-indigo-600' : 'bg-gray-700'}`}
+                      >
+                        <div className={`absolute top-1 w-3 h-3 rounded-full bg-white transition-all ${shadowActive ? 'right-1' : 'left-1'}`} />
+                      </button>
+                    </div>
+                    
+                    <div className="flex justify-between items-center">
+                      <div className="flex flex-col">
+                        <label className="text-xs font-bold text-indigo-300">눌림목 타겟 (Bounce %)</label>
+                        <p className="text-[0.6rem] text-indigo-400/60">저점 대비 반등 시 매수</p>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <input 
+                          type="range" min="0.5" max="5.0" step="0.1" 
+                          value={shadowBounce} 
+                          onChange={(e) => setShadowBounce(Number(e.target.value))} 
+                          className="w-20 accent-indigo-400" 
+                        />
+                        <span className="text-xs font-mono text-indigo-300 w-8 text-right">{shadowBounce}%</span>
+                      </div>
+                    </div>
+                    
+                    <div className="pt-1 border-t border-indigo-500/10">
+                      <p className="text-[0.6rem] text-indigo-400/80 leading-relaxed italic">
+                        * 10초 단위 실시간 트래킹: 장중 최저점이 갱신될 때마다 최적의 Shadow Price로 주문이 자동 정정됩니다.
+                      </p>
+                    </div>
+                  </div>
+                )}
+
                 <label className={`cursor-pointer flex flex-col p-3 rounded-xl border transition-colors ${version === 'V17' ? 'border-purple-500 bg-purple-500/10' : 'border-[#27272a] bg-[#18181b] hover:border-[#3f3f46]'}`}>
                   <div className="flex items-center gap-2">
                     <input type="radio" name="version" value="V17" checked={version === 'V17'} onChange={(e) => setVersion(e.target.value)} className="hidden" />

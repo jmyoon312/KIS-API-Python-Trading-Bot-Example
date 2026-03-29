@@ -719,17 +719,34 @@ async def scheduled_live_sync(context):
                         
                         # 실제 주문은 장중에만 실행
                         if not is_weekend and status_code in ["PRE", "REG"] and not is_morning_sync_window:
-                            if plan and not cfg.is_locked(t, status_code):
+                            # 👤 [V24 Shadow-Strike] 실시간 가격 정정 로직
+                            is_v24 = cfg.get_version(t) == "V24"
+                            is_locked = cfg.is_locked(t, status_code)
+                            
+                            if plan:
                                 orders = plan.get('core_orders', []) + plan.get('bonus_orders', [])
                                 if orders:
-                                    async with tx_lock:
-                                        msg = f"🚀 <b>[{t}] {status_text} 전략 주문 실행</b>\n"
-                                        for o in orders:
-                                            res = broker.send_order(t, o['side'], o['qty'], o['price'], o['type'])
-                                            msg += f"{'✅' if res.get('rt_cd')=='0' else '❌'} {o['side']} {o['qty']}주\n"
-                                            await asyncio.sleep(0.1)
-                                        cfg.set_lock(t, status_code)
-                                        if bot: await context.bot.send_message(cfg.get_chat_id(), msg, parse_mode='HTML')
+                                    should_execute = False
+                                    if not is_locked:
+                                        should_execute = True
+                                    elif is_v24 and status_code == "REG":
+                                        # V24인 경우, 저점 변화에 따른 가격 변동이 있으면 기존 주문 취소 후 재주문
+                                        # (참고: strategy.py에서 day_low를 반영하므로 plan['orders'] 내 가격이 이미 최신임)
+                                        should_execute = True
+                                        async with tx_lock:
+                                            # 기존 미체결 LOC 매수 주문만 골라서 취소
+                                            broker.cancel_targeted_orders(t, side="BUY", ord_dvsn="34") 
+                                            await asyncio.sleep(0.5)
+
+                                    if should_execute:
+                                        async with tx_lock:
+                                            msg = f"🚀 <b>[{t}] {status_text} {'전략 정정' if is_locked else '전략 신규'} 주문 실행</b>\n"
+                                            for o in orders:
+                                                res = broker.send_order(t, o['side'], o['qty'], o['price'], o['type'])
+                                                msg += f"{'✅' if res.get('rt_cd')=='0' else '❌'} {o['side']} {o['qty']}주 (${o['price']})\n"
+                                                await asyncio.sleep(0.1)
+                                            cfg.set_lock(t, status_code)
+                                            if bot: await context.bot.send_message(cfg.get_chat_id(), msg, parse_mode='HTML')
                     except Exception as e: logging.error(f"🚨 [{t}] 전략 에러: {e}")
             else:
                 live_data["market_status"] = "📡 통신 지연 (API)"
