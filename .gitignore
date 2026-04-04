@@ -1,4 +1,5 @@
 # Secrets & Environments
+*.env
 .env
 *_실전투자.env
 실전투자.env
@@ -19,6 +20,24 @@ frontend/node_modules/
 frontend/dist/
 .DS_Store
 
-# IDEs
+# IDEs & System
 .vscode/
 .idea/
+venv/
+letsencrypt/
+.claude/
+.gemini/
+
+# Home Directory / OS hidden files
+.*
+!/.gitignore
+!/.claude.json
+node_modules/
+dist/
+/venv/
+/letsencrypt/
+
+# Build & Deployment (Requested to Exclude)
+Dockerfile
+supervisord.conf
+requirements.txt

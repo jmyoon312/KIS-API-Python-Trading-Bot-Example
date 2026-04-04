@@ -3,7 +3,7 @@
 # ⚠️ 이 주석 및 파일명 표기는 절대 지우지 마세요.
 # ==========================================================
 import math
-from datetime import datetime, timedelta
+from datetime import datetime
 
 class InfiniteStrategy:
     def __init__(self, config):
@@ -12,308 +12,324 @@ class InfiniteStrategy:
     def _ceil(self, val): return math.ceil(val * 100) / 100.0
     def _floor(self, val): return math.floor(val * 100) / 100.0
 
-    # 🌟 [V22 소액 시드 파업 방지 패치] 스마트 소수점 누적 징검다리 매수 로직
-    # 예산이 주가보다 적을 때(math.floor가 0이 될 때) 발생하는 매수 중단 '파업' 현상을 막고,
-    # 현금 소모율은 완벽히 유지하도록 '날짜 기반 가상 난수'를 이용해 소수점 확률만큼 1주를 사모읍니다.
     def _get_smart_qty(self, amt, price):
         if price <= 0: return 0
         raw_qty = amt / price
         base_qty = math.floor(raw_qty)
         fraction = raw_qty - base_qty
-        
-        # 날짜 기반 의사 난수 생성 (오늘 하루 동안은 동일한 난수값 0.00 ~ 0.99 유지)
         now = datetime.now()
         pseudo_rand = ((now.day * 13) + (now.month * 7) + (now.year * 3)) % 100 / 100.0
-        
-        # 소수점 자투리 예산이 난수보다 크면 1주를 추가 매수 (수학적 통계율 수렴)
         if pseudo_rand < fraction:
             base_qty += 1
-            
         return base_qty
 
-    def get_plan(self, ticker, current_price, avg_price, qty, prev_close, ma_5day=0.0, day_low=0.0, market_type="REG", available_cash=0, is_simulation=False, force_turbo_off=False):
-        core_orders = []
-        bonus_orders = []
-        smart_core_orders = []   
-        smart_bonus_orders = []  
-        process_status = "" 
+    # 🛡️ [V18.13 패치] KIS 자전거래(Wash-Trade) 원천 차단 방어벽 엔진
+    def _apply_wash_trade_shield(self, c_orders, b_orders, sc_orders, sb_orders):
+        all_o = c_orders + b_orders + sc_orders + sb_orders
+        has_sell_moc = any(o['type'] in ['MOC', 'MOO'] and o['side'] == 'SELL' for o in all_o)
+        s_prices = [o['price'] for o in all_o if o['side'] == 'SELL' and o['price'] > 0]
+        min_s = min(s_prices) if s_prices else 0.0
+
+        def _clean(lst):
+            res = []
+            for o in lst:
+                if o['side'] == 'BUY':
+                    if has_sell_moc and o['type'] in ['LOC', 'MOC']: continue 
+                    if min_s > 0 and o['price'] >= min_s:
+                        o['price'] = round(min_s - 0.01, 2)
+                        if "🛡️" not in o['desc']: o['desc'] = f"🛡️{o['desc'].replace('👻', '').replace('🧹', '')}"
+                    o['price'] = max(0.01, o['price'])
+                res.append(o)
+            return res
+        return _clean(c_orders), _clean(b_orders), _clean(sc_orders), _clean(sb_orders)
+
+    # 📋 [Base Strategy] V13 Classic - 고정 분할 기반 (V1 원본 정석)
+    def _get_base_v13(self, ticker, split, one_portion_amt, avg_price, star_price, can_buy):
+        slots = {}
+        p_avg = max(0.01, round(avg_price - 0.01, 2))
+        p_star = max(0.01, round(star_price - 0.01, 2)) if star_price > 0 else p_avg
         
-        # ==========================================================
-        # 🛡️ [V18.13 패치] KIS 자전거래(Wash-Trade) 원천 차단 방어벽 엔진
-        # ==========================================================
-        def apply_wash_trade_shield(c_orders, b_orders, sc_orders, sb_orders):
-            all_o = c_orders + b_orders + sc_orders + sb_orders
+        # 기본 원칙: 0.5회분 평단 LOC + 0.5회분 별값 LOC
+        q_avg = self._get_smart_qty(one_portion_amt * 0.5, p_avg) if can_buy else 0
+        q_star = self._get_smart_qty(one_portion_amt * 0.5, p_star) if can_buy else 0
+        
+        slots["slot_1"] = {"side": "BUY", "price": p_avg, "qty": q_avg, "type": "LOC", "desc": "[1차] V13:평단매수", "slot_id": 1}
+        slots["slot_2"] = {"side": "BUY", "price": p_star, "qty": q_star, "type": "LOC", "desc": "[2차] V13:보조매수", "slot_id": 2}
+        
+        return slots
+
+    # 📋 [Base Strategy] V14 Modular - 가변 방어 (V2.1 가변 방어)
+    def _get_base_v14(self, ticker, split, t_val, available_cash, avg_price, star_price, can_buy):
+        slots = {}
+        # 남은 회차에 따라 매수량을 동적으로 결정 (가변 핵심)
+        remaining_splits = max(1, split - t_val)
+        dynamic_one_portion = available_cash / remaining_splits if remaining_splits > 0 else 0
+        p_avg = max(0.01, round(avg_price - 0.01, 2))
+        
+        # V14는 사용자 요청에 따라 평단(Avg)에서 1.0 분량 집중 매수하여 방어력 확보
+        qty = self._get_smart_qty(dynamic_one_portion, p_avg) if can_buy else 0
+        
+        slots["slot_1"] = {"side": "BUY", "price": p_avg, "qty": qty, "type": "LOC", "desc": "[1차] V14:평단매수", "slot_id": 1}
+        slots["slot_2"] = {"side": "BUY", "price": 0, "qty": 0, "type": "LOC", "desc": "-", "slot_id": 2}
+        
+        return slots
+
+    # 📋 [Base Strategy] V24 [Shadow-Strike] - 눌림목 정밀 포격 엔진
+    def _get_base_v24(self, ticker, split, t_val, available_cash, avg_price, day_low, bounce_pct, can_buy):
+        slots = {}
+        # 1. 시드 분할 정책 (남은 회차 기반 동적 분할)
+        remaining_splits = max(1, split - t_val)
+        dynamic_one_portion = available_cash / remaining_splits if remaining_splits > 0 else 0
+        
+        # 🎯 [V24 Core] Shadow Price 산출
+        # Shadow Price = Day Low * (1 + Bounce%)
+        # Final limit = min(Avg Price * 1.05, Shadow Price)
+        bounce_ratio = (bounce_pct / 100.0) if bounce_pct > 0 else 0.015
+        shadow_p = day_low * (1 + bounce_ratio) if day_low > 0 else avg_price
+        
+        # 안전 장치: 평단 대비 5% 캡 적용
+        p_avg = max(0.01, round(avg_price - 0.01, 2))
+        p_shadow = min(avg_price * 1.05, shadow_p)
+        p_shadow = max(0.01, round(p_shadow - 0.01, 2))
+        
+        # V24 Shadow-Strike: 0.5회분 평단 LOC + 0.5회분 섀도우(눌림목) LOC
+        q_avg = self._get_smart_qty(dynamic_one_portion * 0.5, p_avg) if can_buy else 0
+        q_shadow = self._get_smart_qty(dynamic_one_portion * 0.5, p_shadow) if can_buy else 0
+        
+        slots["slot_1"] = {"side": "BUY", "price": p_avg, "qty": q_avg, "type": "LOC", "desc": "[1차] V24:평단매수", "slot_id": 1}
+        slots["slot_2"] = {"side": "BUY", "price": p_shadow, "qty": q_shadow, "type": "LOC", "desc": "[2차] V24:섀도우포격", "slot_id": 2}
+        
+        return slots
+
+    def _apply_tactic_shield(self, split, t_val):
+        dynamic_split = split
+        status = ""
+        if t_val < (split * 0.5):
+            dynamic_split = split
+            status = "🌓전반전"
+        elif t_val < (split * 0.75):
+            dynamic_split = math.floor(split * 1.5)
+            status = "🛡️방어전(2단)"
+        elif t_val < (split * 0.9):
+            dynamic_split = math.floor(split * 2.0)
+            status = "🚨대폭락(3단)"
+        else:
+            dynamic_split = math.floor(split * 2.5)
+            status = "☠️지옥장(4단)"
+        return dynamic_split, status
+
+    # 🛠 [Tactic] Shadow-Strike - 저점 반등 기습 매수
+    def _apply_tactic_shadow(self, avg_price, day_low, base_price, one_portion_amt, can_buy):
+        ref_day_low = day_low if day_low > 0 else base_price
+        shadow_price = self._ceil(ref_day_low * 1.015)
+        # 평단보다 너무 높게 사지 않도록 캡핑
+        final_shadow = min(self._ceil(avg_price * 1.05), shadow_price)
+        
+        f_shadow_p = max(0.01, round(final_shadow - 0.01, 2))
+        s_qty = self._get_smart_qty(one_portion_amt, f_shadow_p) if (can_buy and f_shadow_p > 0) else 0
+        return {"side": "BUY", "price": f_shadow_p, "qty": s_qty, "type": "LOC", "desc": "[3차] 전술매수(Shadow)", "slot_id": 3}
+
+    # 🛠 [Tactic] Turbo Booster - 급락 시 매칭 물량 증폭
+    def _apply_tactic_turbo(self, avg_price, prev_close, safe_ceiling, one_portion_amt, can_buy):
+        ref_price = min(avg_price, prev_close)
+        turbo_price = max(0.01, round(min(self._ceil(ref_price * 0.95) - 0.01, safe_ceiling - 0.01), 2))
+        turbo_qty = self._get_smart_qty(one_portion_amt, turbo_price) if can_buy else 0
+        return {"side": "BUY", "price": turbo_price, "qty": turbo_qty, "type": "LOC", "desc": "[3차] 전술매수(Turbo)", "slot_id": 3}
+
+    # 🛠 [Tactic] Jup-Jup Grid - 자투리 현금 거미줄 매수
+    def _apply_tactic_jupjup(self, avg_price, one_portion_amt, can_buy):
+        base_qty = self._get_smart_qty(one_portion_amt, avg_price)
+        orders = []
+        for i in range(1, 3): # 슬롯 고정 위해 최대 2개만
+            jup_price = self._floor(one_portion_amt / (base_qty + i))
+            safe_jup_p = max(0.01, round(min(jup_price, avg_price - 0.01), 2))
+            q = 1 if can_buy else 0
+            orders.append({"side": "BUY", "price": safe_jup_p, "qty": q, "type": "LOC", "desc": f"[3차] 전술매수(줍줍{i})", "slot_id": 3})
+        return orders
+
+    # 🛠 [V29.0 Tactic] Elastic Snap-back - 이격도(PEI) 기반 과매도 역발상 매수
+    def _apply_tactic_elastic(self, current_price, avg_price, ma_5day, pei_val, one_portion_amt, can_buy):
+        # PEI가 -2.0 미만(2표준편차 하단 돌파)일 때 공격적 매수
+        if pei_val < -2.0 and current_price < ma_5day:
+            bonus_amt = one_portion_amt * 1.5 # 1.5배 물량 투입
+            elastic_p = max(0.01, round(current_price * 1.01, 2)) # 현재가 부근 LOC
+            qty = self._get_smart_qty(bonus_amt, elastic_p) if can_buy else 0
+            return {"side": "BUY", "price": elastic_p, "qty": qty, "type": "LOC", "desc": "[3차] 전술매수(Elastic)", "slot_id": 3}
+        return None
+
+    # 🛠 [V29.0 Tactic] ATR-Dynamic Shield - ATR(변동성) 기반 가변 분할 보정
+    def _apply_tactic_atr_shield(self, split, t_val, atr_val, avg_price):
+        # ATR이 평단 대비 5% 이상이면 시장 변동성 극심으로 판단, 분할수 1.2배 가중
+        volatility_ratio = (atr_val / avg_price) if avg_price > 0 else 0
+        if volatility_ratio > 0.05:
+            return math.floor(split * 1.2), "🛡️ATR-Shield"
+        return split, ""
+
+    # 🛠 [V29.7 Tactic] Upward Sniper - 장중 휩소(속임수 하락) 방어용 상방 스나이퍼
+    def _apply_tactic_sniper(self, current_price, avg_price, day_high, drop_pct=1.5, qty=0):
+        """
+        [상방 스나이퍼 핵심 로직]
+        1. 감기(Locked-on): 주가가 평단가(Avg Price) 보다 높아야 함 (수익권)
+        2. 격발(Trigger): 현재가가 장중 고점(Day High) 대비 drop_pct(1.5%) 이상 하락 시
+        3. 보상: 보유 수량의 25% (1/4)를 즉시 매도하여 수익 확정
+        """
+        if qty <= 0 or current_price <= avg_price or day_high <= 0:
+            return None
             
-            has_sell_moc = any(o['type'] in ['MOC', 'MOO'] and o['side'] == 'SELL' for o in all_o)
+        trigger_price = day_high * (1 - (drop_pct / 100.0))
+        if current_price <= trigger_price:
+            sell_qty = math.ceil(qty / 4)
+            # 스나이퍼는 장중 대응이므로 MARKET 또는 LOC로 즉시 처리 지시
+            return {"side": "SELL", "price": current_price, "qty": sell_qty, "type": "LOC", "desc": "[3차] 전술매도(스나이퍼-격발)", "slot_id": 3}
             
-            s_prices = [o['price'] for o in all_o if o['side'] == 'SELL' and o['price'] > 0]
-            min_s = min(s_prices) if s_prices else 0.0
+        return None
 
-            def _clean(lst):
-                res = []
-                for o in lst:
-                    if o['side'] == 'BUY':
-                        if has_sell_moc and o['type'] in ['LOC', 'MOC']: 
-                            continue 
-                        
-                        if min_s > 0 and o['price'] >= min_s:
-                            o['price'] = round(min_s - 0.01, 2)
-                            if "🛡️" not in o['desc']: 
-                                o['desc'] = f"🛡️교정_{o['desc'].replace('🦇', '').replace('🧹', '')}"
-                        
-                        # 🎯 [V20.2 핫픽스] 마이너스 호가 방어막 공통 적용 (자전거래 방패 내부에서도)
-                        o['price'] = max(0.01, o['price'])
-                            
-                    res.append(o)
-                return res
+    def _get_empty_slots(self, version="V"):
+        return {
+            "slot_1": {"desc": f"[1차] {version}:평단매수", "price": 0, "qty": 0, "status": "WAITING", "side": "BUY", "result": ""},
+            "slot_2": {"desc": f"[2차] {version}:보조매수", "price": 0, "qty": 0, "status": "WAITING", "side": "BUY", "result": ""},
+            "slot_3": {"desc": f"[3차] {version}:전술매수", "price": 0, "qty": 0, "status": "WAITING", "side": "BUY", "result": ""},
+            "slot_4": {"desc": f"[4차] {version}:익절매도", "price": 0, "qty": 0, "status": "WAITING", "side": "SELL", "result": ""},
+            "slot_5": {"desc": f"[5차] {version}:목표매도", "price": 0, "qty": 0, "status": "WAITING", "side": "SELL", "result": ""}
+        }
 
-            return _clean(c_orders), _clean(b_orders), _clean(sc_orders), _clean(sb_orders)
-        # ==========================================================
-
+    def get_plan(self, ticker, current_price, avg_price, qty, prev_close, 
+                 ma_5day=0.0, day_low=0.0, day_high=0.0, pei_val=0.0, atr_val=0.0,
+                 market_type="REG", available_cash=0, 
+                 is_simulation=False, tactics_config=None, force_turbo_off=False):
+        
+        # 0. 초기화 및 기본 정보 획득
+        if tactics_config is None: tactics_config = {}
+        process_status = ""
+        
         other_locked_cash = self.cfg.get_total_locked_cash(exclude_ticker=ticker)
         real_available_cash = max(0, available_cash - other_locked_cash)
         
         split = self.cfg.get_split_count(ticker)      
-        target_pct_val = self.cfg.get_target_profit(ticker) 
-        target_ratio = target_pct_val / 100.0
+        target_pct = self.cfg.get_target_profit(ticker) 
+        target_ratio = target_pct / 100.0
         version = self.cfg.get_version(ticker)
         
-        rev_state = self.cfg.get_reverse_state(ticker)
-        is_reverse = False  # 🌟 [V22 패치] 감정적인 손절매도인 리버스 모드 완전 폐기 (무력화)
-        rev_day = 0
-        exit_target = 0.0
-
+        plan_slots = self._get_empty_slots(version)
+        
         t_val, base_portion = self.cfg.get_absolute_t_val(ticker, qty, avg_price)
         target_price = self._ceil(avg_price * (1 + target_ratio)) if avg_price > 0 else 0
-        is_jackpot_reached = target_price > 0 and current_price >= target_price
-
-        # 🌟 [V23.3] 전략 버전별 분할 엔진 차별화 (Class vs Modular)
-        if version == "V13":
-            # [V13 Classic] 고정 분할 모드 (기어 변속 없이 정직하게 분할)
-            dynamic_split = split
-            process_status = "💎클래식(고정)"
-        else:
-            # [V14/V17 Modular] 동적 기어 변속 (Dynamic Split) 엔진
-            if t_val < (split * 0.5):
-                dynamic_split = split  # 평시 (진행률 0~50%)
-                process_status = "🌓전반전(1단)" if t_val < (split * 0.25) else "🌕후반전(1단)"
-            elif t_val < (split * 0.75):
-                dynamic_split = math.floor(split * 1.5)     # 약하락장 진입 시 1.5배 감속 (예: 60분할)
-                process_status = f"🛡️방어전(2단:{dynamic_split}분할)"
-            elif t_val < (split * 0.9):
-                dynamic_split = math.floor(split * 2.0)     # 대폭락장 진입 시 2.0배 감속 (예: 80분할)
-                process_status = f"🚨대폭락(3단:{dynamic_split}분할)"
-            else:
-                dynamic_split = math.floor(split * 2.5)     # 지옥장 진입 시 2.5배 감속 (예: 100분할)
-                process_status = f"☠️지옥장(4단:{dynamic_split}분할)"
-
-        # 동적 분할수에 따른 현재 1회 매수 금액 (원금 시드 기준)
-        one_portion_amt = self.cfg.get_active_seed(ticker) / dynamic_split if dynamic_split > 0 else base_portion
-        is_money_short = False if is_simulation else (real_available_cash < one_portion_amt)
-
-        # 🌟 기존 손실확정 리버스 모드 로직은 [V22]에서 더 안정적인 동적분할로 완전 대체되어 삭제됨.
-
+        
+        # 별값(Star Price) 계산 (Sniper Exit 용)
         depreciation_factor = 2.0 / split if split > 0 else 0.1
         star_ratio = target_ratio - (target_ratio * depreciation_factor * t_val)
+        star_price = self._ceil(avg_price * (1 + star_ratio)) if avg_price > 0 else 0
         
-        if is_reverse:
-            if ma_5day > 0: star_price = round(ma_5day, 2)
-            else: star_price = round(avg_price, 2)
-
-            escrow_cash = self.cfg.get_escrow_cash(ticker)
-            one_portion_amt = (escrow_cash / 4.0) if escrow_cash > 0 else base_portion
-        else:
-            star_price = self._ceil(avg_price * (1 + star_ratio)) if avg_price > 0 else 0
-            
-        is_last_lap = (split - 1) < t_val < split
-        
-        if is_simulation: is_money_short = False
-        else: is_money_short = real_available_cash < one_portion_amt
-
         base_price = current_price if current_price > 0 else prev_close
-        if base_price <= 0: 
-            return {"orders": [], "core_orders": [], "bonus_orders": [], "smart_core_orders": [], "smart_bonus_orders": [], "t_val": t_val, "split": split, "dynamic_split": dynamic_split, "one_portion": one_portion_amt, "process_status": "⛔가격오류", "is_reverse": is_reverse, "star_price": star_price, "star_ratio": star_ratio, "real_cash_used": real_available_cash}
+        if base_price <= 0: return {"orders": [], "process_status": "⛔가격오류", "slots": plan_slots}
 
+        # 1. 전술: [The Shield] 가변 분할 적용
+        dynamic_split = split
+        shield_status = ""
+        if tactics_config.get("shield", False):
+            dynamic_split, shield_status = self._apply_tactic_shield(split, t_val)
+            
+            # [V29.0] ATR 변동성 보정 추가 (선행 지표 결합)
+            if tactics_config.get("atr_shield", False):
+                dynamic_split, atr_status = self._apply_tactic_atr_shield(dynamic_split, t_val, atr_val, avg_price)
+                if atr_status: shield_status += f"({atr_status})"
+            
+            process_status = shield_status
+        elif version == "V14":
+            process_status = "💎가변(Modular)"
+        elif version == "V13":
+            process_status = "⚓클래식(Classic)"
+        else:
+            process_status = "✨기본전략"
+
+        one_portion_amt = self.cfg.get_active_seed(ticker) / dynamic_split if dynamic_split > 0 else base_portion
+        is_money_short = False if is_simulation else (real_available_cash < one_portion_amt)
+        is_last_lap = (split - 1) < t_val < split
+        can_buy = not is_money_short and not is_last_lap
+        safe_ceiling = min(avg_price, star_price) if star_price > 0 else avg_price
+
+        # 2. 시장 상황별 분기 (프리마켓 등)
         if market_type == "PRE_CHECK":
-            process_status = "🌅프리마켓"
-            if qty > 0 and target_price > 0 and current_price >= target_price and not is_reverse:
-                core_orders.append({"side": "SELL", "price": current_price, "qty": qty, "type": "LIMIT", "desc": "🌅프리:목표돌파익절"})
-            orders = core_orders + bonus_orders
-            return {"orders": orders, "core_orders": core_orders, "bonus_orders": bonus_orders, "smart_core_orders": [], "smart_bonus_orders": [], "t_val": t_val, "split": split, "dynamic_split": dynamic_split, "one_portion": one_portion_amt, "process_status": process_status, "is_reverse": is_reverse, "star_price": star_price, "star_ratio": star_ratio, "real_cash_used": real_available_cash}
+            if qty > 0 and target_price > 0 and current_price >= target_price:
+                plan_slots["slot_5"] = {"side": "SELL", "price": current_price, "qty": qty, "type": "LIMIT", "desc": "🌅프리:목표돌파", "slot_id": 5, "status": "WAITING", "result": ""}
+            return {"orders": [v for k,v in plan_slots.items() if v.get('qty', 0) > 0], "process_status": "🌅프리마켓", "slots": plan_slots}
 
-        if market_type == "REG":
-            if qty == 0:
-                process_status = "✨새출발"
-                # 🎯 [V20.2 핫픽스] 마이너스 호가 하한선 방어
-                buy_price = max(0.01, round(self._ceil(base_price * 1.15) - 0.01, 2))
-                buy_qty = self._get_smart_qty(one_portion_amt, buy_price)
-                if buy_qty > 0:
-                    core_orders.append({"side": "BUY", "price": buy_price, "qty": buy_qty, "type": "LOC", "desc": "🆕새출발"})
-                orders = core_orders + bonus_orders
-                return {"orders": orders, "core_orders": core_orders, "bonus_orders": bonus_orders, "smart_core_orders": [], "smart_bonus_orders": [], "t_val": t_val, "split": split, "dynamic_split": dynamic_split, "one_portion": one_portion_amt, "process_status": process_status, "is_reverse": False, "star_price": star_price, "star_ratio": star_ratio, "real_cash_used": real_available_cash}
+        # [새출발 로직]
+        if qty == 0:
+            buy_price = max(0.01, round(self._ceil(base_price * 1.05) - 0.01, 2))
+            buy_qty = self._get_smart_qty(one_portion_amt, buy_price) if not is_money_short else 0
+            # 새출발 시에는 모든 슬롯 초기화 상태로 1번 슬롯만 채움
+            plan_slots["slot_1"] = {"side": "BUY", "price": buy_price, "qty": buy_qty, "type": "LOC", "desc": f"[1차] {version}:평단매수(새출발)", "slot_id": 1, "status": "WAITING", "result": ""}
+            return {"orders": [plan_slots["slot_1"]] if buy_qty > 0 else [], "process_status": "✨새출발", "slots": plan_slots, "version": version}
 
-            if is_reverse:
-                sell_divisor = 10 if split <= 20 else 20
-                
-                # 🎯 [V21.4 로직 2 패치] 리버스 최소 4주 매도 보장 & 수량 부족 시 전량 청산
-                if qty < 4:
-                    sell_qty = qty # 4주도 안 남았으면 분할 불가하므로 그냥 잔량 전량 청산
-                else:
-                    sell_qty = max(4, math.floor(qty / sell_divisor)) 
-
-                is_emergency_cash_needed = (real_available_cash < base_price) and (rev_day > 1)
-
-                if rev_day == 1 or is_emergency_cash_needed:
-                    process_status = "🩸리버스(긴급수혈)" if is_emergency_cash_needed else "🚨리버스(1일차)"
-                    
-                    if sell_qty > 0:
-                        desc_str = "🩸수혈매도" if is_emergency_cash_needed else "🛡️의무매도"
-                        if qty < 4: desc_str = "💥잔량청산(수량부족)"
-                        core_orders.append({"side": "SELL", "price": 0, "qty": sell_qty, "type": "MOC", "desc": desc_str})
-                else:
-                    process_status = f"🔄리버스({rev_day}일차)"
-                    buy_qty = 0
-                    buy_price = 0
-                    if one_portion_amt > 0 and star_price > 0:
-                        # 🎯 [V20.2 핫픽스] 마이너스 호가 하한선 방어
-                        buy_price = max(0.01, round(star_price - 0.01, 2))
-                        if buy_price > 0: 
-                            buy_qty = self._get_smart_qty(one_portion_amt, buy_price)
-                            if buy_qty > 0:
-                                core_orders.append({"side": "BUY", "price": buy_price, "qty": buy_qty, "type": "LOC", "desc": "⚓잔금매수"})
-                    
-                    if sell_qty > 0 and star_price > 0:
-                        core_orders.append({"side": "SELL", "price": star_price, "qty": sell_qty, "type": "LOC", "desc": "🌟별값매도"})
-
-                    if one_portion_amt > 0 and buy_price > 0:
-                        for i in range(1, 6):
-                            target_qty = buy_qty + i 
-                            raw_jup_price = self._floor(one_portion_amt / target_qty)
-                            capped_jup_price = min(raw_jup_price, buy_price - 0.01)
-                            # 🎯 [V20.2 핫픽스] 마이너스 호가 하한선 방어
-                            jup_price = max(0.01, round(capped_jup_price, 2))
-                            if jup_price > 0:
-                                bonus_orders.append({"side": "BUY", "price": jup_price, "qty": 1, "type": "LOC", "desc": f"🧹리버스줍줍({i})" })
-                
-                if market_type == "REG":
-                    self.cfg.set_reverse_state(ticker, True, rev_day, exit_target)
-                        
-                core_orders, bonus_orders, smart_core_orders, smart_bonus_orders = apply_wash_trade_shield(core_orders, bonus_orders, smart_core_orders, smart_bonus_orders)        
-                orders = core_orders + bonus_orders
-                return {"orders": orders, "core_orders": core_orders, "bonus_orders": bonus_orders, "smart_core_orders": [], "smart_bonus_orders": [], "t_val": t_val, "split": split, "dynamic_split": dynamic_split, "one_portion": one_portion_amt, "process_status": process_status, "is_reverse": is_reverse, "star_price": star_price, "star_ratio": star_ratio, "real_cash_used": real_available_cash}
-
-            if is_jackpot_reached and (t_val > (split - 1) or is_money_short):
-                process_status = "🎉대박익절"
-            elif is_money_short: 
-                process_status = "🛡️시드고갈(방어모드)"
-
-            # 🎯 [V20.2 핫픽스] T값 비정상 폭주(수동 매수, 시드 오류) 감지 꼬리표
-            if t_val > (split * 1.1):
-                process_status = "🚨T값폭주(역산경고)"
-
-            can_buy = not is_money_short and not is_last_lap
-            is_turbo_active = False if force_turbo_off else self.cfg.get_turbo_mode()
+        # 3. 베이스 전략별 슬롯 할당
+        is_v4_reverse = False
+        rev_star_price = 0
+        if version == "V24" and t_val >= (split - 1):
+            is_v4_reverse = True
+            process_status = "🚨제로_리버스(소진)"
+            safe_floor_price = self._ceil(avg_price * 1.005)
+            rev_star_price = max(self._ceil(ma_5day), safe_floor_price) if ma_5day > 0 else safe_floor_price
+            rev_qty = max(1, math.floor(qty / 20))
+            plan_slots["slot_4"] = {"side": "SELL", "price": rev_star_price, "qty": rev_qty, "type": "LOC", "desc": "[4차] 리버스테크(매도)", "slot_id": 4, "status": "WAITING", "result": ""}
+            plan_slots["slot_1"] = {"side": "BUY", "price": rev_star_price, "qty": rev_qty, "type": "LOC", "desc": "[1차] 리버스테크(매칭)", "slot_id": 1, "status": "WAITING", "result": ""}
+        else:
+            if version == "V24":
+                bounce_val = tactics_config.get("shadow_bounce", 1.5) if tactics_config else 1.5
+                base_slots = self._get_base_v24(ticker, split, t_val, real_available_cash, avg_price, day_low, bounce_val, can_buy)
+            elif version == "V14":
+                base_slots = self._get_base_v14(ticker, split, t_val, real_available_cash, avg_price, star_price, can_buy)
+            else:
+                base_slots = self._get_base_v13(ticker, split, one_portion_amt, avg_price, star_price, can_buy)
             
-            safe_ceiling = min(avg_price, star_price) if star_price > 0 else avg_price
+            for k, v in base_slots.items():
+                plan_slots[k].update(v)
 
-            # 👤 [V24] Shadow-Strike: 저점 추격 매입 가격 산출
-            is_shadow_active = self.cfg.is_shadow_active(ticker)
-            shadow_bounce = self.cfg.get_shadow_bounce(ticker) / 100.0
+        # 4. 전술(Tactics) 슬롯 할당 (Slot 3)
+        if not is_v4_reverse:
+            if tactics_config.get("elastic", False): # [V29.0] Elastic 우선 적용
+                e_order = self._apply_tactic_elastic(current_price, avg_price, ma_5day, pei_val, one_portion_amt, can_buy)
+                if e_order: plan_slots["slot_3"].update(e_order)
             
-            if is_shadow_active and day_low > 0:
-                # 저점 대비 지정된 % 반등한 가격 (현실적 눌림목)
-                shadow_price = self._floor(day_low * (1 + shadow_bounce))
-                # 평단가보다 높더라도 최대 5% 마진까지는 추격 허용 (MOC 효과 재현)
-                shadow_ceiling = avg_price * 1.05 if avg_price > 0 else current_price * 1.05
-                shadow_buy_price = min(shadow_ceiling, shadow_price)
+            if not plan_slots["slot_3"].get('qty'): # Elastic/Sniper 미발동 시 기존 전술
+                if tactics_config.get("sniper", False): # [V29.7] Sniper 격발 체크
+                    s_drop = tactics_config.get("sniper_drop", 1.5)
+                    s_order = self._apply_tactic_sniper(current_price, avg_price, day_high, s_drop, qty)
+                    if s_order: plan_slots["slot_3"].update(s_order)
                 
-                # Shadow가 활성화된 경우 평소보다 높은 가격에서도 LOC 체결 유도
-                if shadow_buy_price > safe_ceiling:
-                    safe_ceiling = shadow_buy_price
-                    process_status = f"👤Shadow({process_status})"
+                if not plan_slots["slot_3"].get('qty'): # 스나이퍼 미격발 시 하위 전술 감시
+                    if tactics_config.get("shadow", False):
+                        plan_slots["slot_3"].update(self._apply_tactic_shadow(avg_price, day_low, base_price, one_portion_amt, can_buy))
+                    elif tactics_config.get("turbo", False):
+                        plan_slots["slot_3"].update(self._apply_tactic_turbo(avg_price, prev_close, safe_ceiling, one_portion_amt, can_buy))
+                    elif tactics_config.get("jupjup", False):
+                        j_orders = self._apply_tactic_jupjup(avg_price, one_portion_amt, can_buy)
+                        if j_orders: plan_slots["slot_3"].update(j_orders[0])
 
-            if is_turbo_active and not is_last_lap:
-                if is_simulation or real_available_cash >= one_portion_amt:
-                    ref_price = min(avg_price, prev_close)
-                    raw_turbo = self._ceil(ref_price * 0.95) - 0.01
-                    # 🎯 [V20.2 핫픽스] 마이너스 호가 하한선 방어
-                    turbo_price = max(0.01, round(min(raw_turbo, safe_ceiling - 0.01), 2))
-                    turbo_qty = self._get_smart_qty(one_portion_amt, turbo_price)
-                    if turbo_qty > 0:
-                        core_orders.append({"side": "BUY", "price": turbo_price, "qty": turbo_qty, "type": "LOC", "desc": "🏎️가속매수"})
+        # 5. 매도 로직 슬롯 할당 (Slot 4, 5)
+        if qty > 0 and not is_v4_reverse:
+            q_qty = math.ceil(qty / 4)
+            rem_qty = qty - q_qty
+            if tactics_config.get("sniper", False) or version == "V24":
+                if star_price > 0:
+                    plan_slots["slot_4"].update({"side": "SELL", "price": star_price, "qty": q_qty, "type": "LOC", "desc": f"[4차] {version}:익절매도", "slot_id": 4})
+                if target_price > 0:
+                    plan_slots["slot_5"].update({"side": "SELL", "price": target_price, "qty": rem_qty, "type": "LIMIT", "desc": f"[5차] {version}:목표매도", "slot_id": 5})
+            else:
+                if target_price > 0:
+                    plan_slots["slot_5"].update({"side": "SELL", "price": target_price, "qty": qty, "type": "LIMIT", "desc": f"[5차] {version}:목표매도", "slot_id": 5})
 
-            standard_buy_qty = 0 
-            N = self._get_smart_qty(one_portion_amt, avg_price)
-            # 🎯 [V20.2 핫픽스] 마이너스 호가 하한선 방어
-            p_avg = max(0.01, round(min(self._ceil(avg_price) - 0.01, safe_ceiling - 0.01), 2))
-            
-            if can_buy:
-                # 🎯 [V20.2 핫픽스] 마이너스 호가 하한선 방어
-                p_star = max(0.01, round(star_price - 0.01, 2))
+        # 6. 실 주문 리스트 생성
+        all_orders = [o for k, o in plan_slots.items() if o.get('qty', 0) > 0]
+        
+        v4_star_price = rev_star_price if is_v4_reverse else star_price
+        
+        return {
+            "orders": all_orders,
+            "slots": plan_slots,
+            "t_val": t_val, "split": split, "dynamic_split": dynamic_split, 
+            "one_portion": one_portion_amt, "process_status": process_status,
+            "star_price": v4_star_price, "star_ratio": star_ratio,
+            "version": version
+        }
 
-                if t_val < (split / 2):
-                    half_amt = one_portion_amt * 0.5
-                    q_avg_init = self._get_smart_qty(half_amt, p_avg)
-                    q_star = self._get_smart_qty(half_amt, p_star)
-                    total_basic = q_avg_init + q_star
-                    if total_basic < N: q_avg = q_avg_init + (N - total_basic)
-                    else: q_avg = q_avg_init
-                    
-                    if q_avg > 0:
-                        core_orders.append({"side": "BUY", "price": p_avg, "qty": q_avg, "type": "LOC", "desc": "⚓평단매수"})
-                        standard_buy_qty += q_avg
-                    if q_star > 0:
-                        core_orders.append({"side": "BUY", "price": p_star, "qty": q_star, "type": "LOC", "desc": "💫별값매수"})
-                        standard_buy_qty += q_star
-                else: 
-                    if p_star > 0:
-                        q_star = self._get_smart_qty(one_portion_amt, p_star)
-                        if q_star > 0:
-                            core_orders.append({"side": "BUY", "price": p_star, "qty": q_star, "type": "LOC", "desc": "💫별값매수"})
-                            standard_buy_qty += q_star
-
-            if one_portion_amt > 0 and (is_simulation or not is_money_short):
-                base_qty_for_jup = self._get_smart_qty(one_portion_amt, avg_price)
-                if base_qty_for_jup > 0:
-                    for i in range(1, 6):
-                        jup_price = self._floor(one_portion_amt / (base_qty_for_jup + i))
-                        capped_jup_price = round(min(jup_price, avg_price - 0.01), 2)
-                        # 🎯 [V20.2 핫픽스] 마이너스 호가 하한선 방어
-                        if capped_jup_price > 0:
-                            safe_jup_price = max(0.01, capped_jup_price)
-                            bonus_orders.append({"side": "BUY", "price": safe_jup_price, "qty": 1, "type": "LOC", "desc": f"🧹줍줍({i})"})
-
-            # ==========================================================
-            # 🚨 [V21.3 오리지널 룰 복구] 정규장 LOC 매도는 무조건 별값(star_price)
-            # ==========================================================
-            if qty > 0:
-                q_qty = math.ceil(qty / 4)
-                rem_qty = qty - q_qty
-                
-                # V17이든 V14이든 17:30 정규장 LOC 쿼터매도는 오리지널 무매 원칙을 철저히 준수함
-                if star_price > 0 and q_qty > 0:
-                    core_orders.append({"side": "SELL", "price": star_price, "qty": q_qty, "type": "LOC", "desc": "🌟별값매도"})
-                if target_price > 0 and rem_qty > 0:
-                    core_orders.append({"side": "SELL", "price": target_price, "qty": rem_qty, "type": "LIMIT", "desc": "🎯목표매도"})
-                    
-                # V17 스나이퍼(시크릿) 전용: 쿼터 익절 성공 시 관망 대비용 스마트 방어 매수 장전
-                if version == "V17":
-                    if can_buy and p_avg > 0:
-                        smart_core_orders.append({"side": "BUY", "price": p_avg, "qty": N, "type": "LOC", "desc": "🦇스마트방어(평단)"})
-                        for i in range(1, 6):
-                            j_price = self._floor(one_portion_amt / (N + i))
-                            c_j_price = round(min(j_price, p_avg - 0.01), 2)
-                            if c_j_price > 0:
-                                safe_c_j_price = max(0.01, c_j_price)
-                                smart_bonus_orders.append({"side": "BUY", "price": safe_c_j_price, "qty": 1, "type": "LOC", "desc": f"🧹스마트줍줍({i})"})
-
-            core_orders, bonus_orders, smart_core_orders, smart_bonus_orders = apply_wash_trade_shield(core_orders, bonus_orders, smart_core_orders, smart_bonus_orders)        
-            orders = core_orders + bonus_orders
-            
-            return {
-                "orders": orders, "core_orders": core_orders, "bonus_orders": bonus_orders,
-                "smart_core_orders": smart_core_orders, "smart_bonus_orders": smart_bonus_orders,
-                "t_val": t_val, "split": split, "dynamic_split": dynamic_split, "one_portion": one_portion_amt, "process_status": process_status,
-                "is_reverse": is_reverse, "star_price": star_price, "star_ratio": star_ratio,
-                "real_cash_used": real_available_cash
-            }

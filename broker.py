@@ -16,6 +16,9 @@ import pandas as pd   # 🔥 V20 추가: 동적 타점 계산용
 import numpy as np    # 🔥 V20 추가: 동적 타점 계산용
 
 class KoreaInvestmentBroker:
+    # ⚡ [V24 Shared Cache] 모으/실전 간 가격 불일치 해소 및 API 부하 절감을 위한 클래스 레벨 공유 캐시
+    _price_cache = {} # {ticker: (timestamp, data)}
+
     def __init__(self, app_key, app_secret, cano, acnt_prdt_cd="01", is_real=False):
         self.app_key = app_key
         self.app_secret = app_secret
@@ -66,7 +69,7 @@ class KoreaInvestmentBroker:
         body = {"grant_type": "client_credentials", "appkey": self.app_key, "appsecret": self.app_secret}
         
         try:
-            res = requests.post(url, headers={"content-type": "application/json"}, data=json.dumps(body), timeout=10)
+            res = requests.post(url, headers={"content-type": "application/json"}, data=json.dumps(body), timeout=5)
             data = res.json()
             if 'access_token' in data:
                 self.token = data['access_token']
@@ -98,17 +101,20 @@ class KoreaInvestmentBroker:
 
     def _api_request(self, method, url, headers, params=None, data=None):
         """🌟 [V22.2 Bulldog Engine] 5회 리트라이 및 유량 제한 대응용 강화 엔진"""
-        max_retries = 5
+        # 🚀 [V29.8 Optimization] 모의투자 리트라이 단축 (동기화 병목 방어)
+        max_retries = 3 if not getattr(self, 'is_real', True) else 5
         for attempt in range(max_retries):
             try:
                 if method.upper() == "GET":
-                    res = requests.get(url, headers=headers, params=params, timeout=15)
+                    res = requests.get(url, headers=headers, params=params, timeout=5)
                 else:
-                    res = requests.post(url, headers=headers, data=json.dumps(data) if data else None, timeout=15)
+                    res = requests.post(url, headers=headers, data=json.dumps(data) if data else None, timeout=5)
                 
                 # HTTP 상태 코드 확인 (429: 유량제한, 500대: 서버오류)
                 if res.status_code == 429 or res.status_code >= 500:
-                    wait_sec = 1.5 * (attempt + 1)
+                    # 🚀 [V29.8] 재시도 간격 조정
+                    multiplier = 1.0 if not getattr(self, 'is_real', True) else 1.5
+                    wait_sec = multiplier * (attempt + 1)
                     print(f"⚠️ [Bulldog] {self.mode_tag} 서버 응답 지연 ({res.status_code}). {wait_sec}초 후 재시도... ({attempt+1}/{max_retries})")
                     time.sleep(wait_sec)
                     continue
@@ -137,7 +143,7 @@ class KoreaInvestmentBroker:
                 return res, resp_json
             except Exception as e:
                 wait_sec = 1.0 * (attempt + 1)
-                print(f"⚠️ [Bulldog] {self.mode_tag} 통신 예외 발생: {e}. {wait_sec}초 후 재시도... ({attempt+1}/{max_retries})")
+                print(f"⚠️ [Bulldog] {self.mode_tag} 통신 예외 발생 ({type(e).__name__}): {e}. {wait_sec}초 후 재시도... ({attempt+1}/{max_retries})")
                 if attempt == max_retries - 1: return None, {}
                 time.sleep(wait_sec)
         return None, {}
@@ -194,81 +200,108 @@ class KoreaInvestmentBroker:
             print(f"⚠️ [Broker] 거래소 코드 동적 획득 실패: {ticker} - {e}")
 
         if not dynamic_success:
-            if ticker == "SOXL": price_cd, order_cd = "AMS", "AMEX"
+            if ticker == "SOXL": price_cd, order_cd = "NAS", "NASD" # SOXL은 NASDAQ 상장이나 KIS에서는 AMEX/NASD 혼용됨. 안전하게 NASD 시도
             elif ticker == "TQQQ": price_cd, order_cd = "NAS", "NASD"
+
+        # 🧪 [V26.7] 모의투자 매도 시 3자리 코드(NAS, NYS, AMS) 필수 대응
+        if not self.is_real:
+            if order_cd == "NASD": order_cd = "NAS"
+            elif order_cd == "NYSE": order_cd = "NYS"
+            elif order_cd == "AMEX": order_cd = "AMS"
 
         self._excg_cd_cache[ticker] = {'PRICE': price_cd, 'ORDER': order_cd}
         return price_cd if target_api == "PRICE" else order_cd
 
     def get_account_balance(self):
         cash = 0.0
-        holdings = None 
+        holdings = {}
         
-        # 🔄 모의투자: CTRP6504R(해외주식 체결기준잔고)은 모의투자에서 지원되지 않음
-        # VTTS3012R output2에도 ovrs_ord_psbl_amt 필드 없음
-        # → VTTS3007R(해외주식 매수가능금액조회) API로 현금을 직접 조회
-        # (실전: CTRP6504R로 frcr_dncl_amt_2 등에서 외화예수금 계산)
+        # 🧪 [V24.5] 계좌 데이터 수집 성공 여부 판정 로직 강화 (0원 계좌 지원)
+        success_count = 0
+        
+        # 🔄 모의투자: VTTS3007R(해외주식 매수가능금액조회) API로 현금을 직접 조회
         try:
             psamount_params = {
                 "CANO": self.cano, "ACNT_PRDT_CD": self.acnt_prdt_cd,
-                "OVRS_EXCG_CD": "NASD",  # 나스닥 기준 (거래소 무관하게 계좌 전체 가능금액 반환)
+                "OVRS_EXCG_CD": "NASD",  # 나스닥 기준
                 "OVRS_ORD_UNPR": "0",    # 0이면 전체 주문가능금액 조회
-                "ITEM_CD": "TQQQ"        # 🔄 모의투자: 종목코드 필수 (아무 종목이나 가능, 계좌 전체 가능금액 반환)
+                "ITEM_CD": "TQQQ"        # 종목코드 필수 (전체 가능금액 반환용)
             }
-            res_ps = self._call_api(self._get_tr_id("VTTS3007R"), "/uapi/overseas-stock/v1/trading/inquire-psamount", "GET", psamount_params)
-            if res_ps.get('rt_cd') == '0':
+            res_ps = self._call_api("VTTS3007R", "/uapi/overseas-stock/v1/trading/inquire-psamount", "GET", psamount_params)
+            
+            if res_ps and res_ps.get('rt_cd') == '0':
+                success_count += 1
                 output = res_ps.get('output', {})
-
                 cash = self._safe_float(output.get('frcr_ord_psbl_amt1', 0))
                 if cash <= 0:
                     cash = self._safe_float(output.get('ovrs_ord_psbl_amt', 0))
+            elif res_ps:
+                m_str = "REAL" if self.is_real else "MOCK"
+                logging.warning(f"⚠️ [Broker] 매수가능금액 API 실패 ({m_str}) - rt_cd: {res_ps.get('rt_cd')}, msg1: {res_ps.get('msg1', '메시지 없음')}")
             else:
-                logging.warning(f"⚠️ [Broker] 매수가능금액 API 실패 ({self.mode}) - rt_cd: {res_ps.get('rt_cd')}, msg1: {res_ps.get('msg1', '메시지 없음')}")
+                logging.warning("⚠️ [Broker] 매수가능금액 API 응답 없음 (None)")
         except Exception as e:
             logging.warning(f"⚠️ [Broker] 매수가능금액 조회 예외: {e}")
 
-        holdings = {}
         target_excgs = ["NASD", "AMEX", "NYSE"] 
-        
         for excg in target_excgs:
-            if not self.is_real: time.sleep(1) # 모의투자 초당 제한 회피
-            params_hold = {"CANO": self.cano, "ACNT_PRDT_CD": self.acnt_prdt_cd, "OVRS_EXCG_CD": excg, "TR_CRCY_CD": "USD", "CTX_AREA_FK200": "", "CTX_AREA_NK200": ""}
-            res_hold = self._call_api(self._get_tr_id("VTTS3012R"), "/uapi/overseas-stock/v1/trading/inquire-balance", "GET", params_hold)
-            
-            if res_hold.get('rt_cd') == '0':
-                o2 = res_hold.get('output2', {})
-                if isinstance(o2, list) and len(o2) > 0: o2 = o2[0]
+            try:
+                if not self.is_real: time.sleep(1) # 모의투자 초당 제한 회피
+                params_hold = {"CANO": self.cano, "ACNT_PRDT_CD": self.acnt_prdt_cd, "OVRS_EXCG_CD": excg, "TR_CRCY_CD": "USD", "CTX_AREA_FK200": "", "CTX_AREA_NK200": ""}
+                res_hold = self._call_api("VTTS3012R", "/uapi/overseas-stock/v1/trading/inquire-balance", "GET", params_hold)
                 
-                # 가용현금 갱신
-                new_cash = self._safe_float(o2.get('ovrs_ord_psbl_amt', 0))
-                if new_cash > cash: cash = new_cash
+                if res_hold and res_hold.get('rt_cd') == '0':
+                    success_count += 1
+                    o2 = res_hold.get('output2', {})
+                    if isinstance(o2, list) and len(o2) > 0: o2 = o2[0]
+                    
+                    # 가용현금 보정
+                    new_cash = self._safe_float(o2.get('ovrs_ord_psbl_amt', 0))
+                    if new_cash > cash: cash = new_cash
 
-                # 평가액 합계 갱신
-                h_val = self._safe_float(o2.get('evlu_amt_smtl1', 0))
-                if h_val <= 0: h_val = self._safe_float(o2.get('tot_evlu_pfls_amt', 0))
-                if h_val <= 0: h_val = self._safe_float(o2.get('frcr_evlu_amt2', 0))
-                self.last_holdings_value = max(self.last_holdings_value, h_val)
-                
-                for item in res_hold.get('output1', []):
-                    ticker = item.get('ovrs_pdno')
-                    if not ticker: ticker = item.get('pdno')
-                    
-                    qty = int(self._safe_float(item.get('ovrs_cblc_qty', 0)))
-                    if qty <= 0: qty = int(self._safe_float(item.get('cblc_qty', 0)))
-                    
-                    avg = self._safe_float(item.get('pchs_avg_pric', 0))
-                    if qty > 0 and ticker not in holdings: 
-                        holdings[ticker] = {'qty': qty, 'avg': avg}
+                    # 보유 종목 추출
+                    for item in res_hold.get('output1', []):
+                        ticker = item.get('ovrs_pdno') or item.get('pdno')
+                        if not ticker: continue
+                        
+                        qty = int(self._safe_float(item.get('ovrs_cblc_qty', 0)) or self._safe_float(item.get('cblc_qty', 0)))
+                        avg = self._safe_float(item.get('pchs_avg_pric', 0))
+                        
+                        if qty > 0:
+                            holdings[ticker] = {'qty': qty, 'avg': avg}
+                elif res_hold and res_hold.get('rt_cd') not in ['0', '999']:
+                    # 999는 통계적 실패(타임아웃)이므로 성공으로 치지 않음
+                    pass
+            except Exception as e:
+                logging.warning(f"⚠️ [Broker] {excg} 잔고 조회 중 예외: {e}")
         
-        return cash, holdings  # 🔄 모의투자: 빈 딕셔너리({})도 API 성공으로 반환 (실전: holdings if holdings else None)
+        # 🧪 [V29.8 Persistence] API 통신 실패 시 기존 데이터 보호
+        if success_count == 0:
+            logging.error(f"🚨 [Broker] {self.mode_tag} 모든 잔고 조회 API 실패. 데이터 보호를 위해 'None'을 반환합니다.")
+            return None, None
+        
+        return cash, holdings
 
     def get_current_price(self, ticker, is_market_closed=False):
+        # ⚡ [V24] 공유 캐시 확인 (5초 이내 데이터면 즉시 반환)
+        now = time.time()
+        if ticker in KoreaInvestmentBroker._price_cache:
+            ts, data = KoreaInvestmentBroker._price_cache[ticker]
+            if now - ts < 5:
+                print(f"⚡ [Shared-Cache] {self.mode_tag} {ticker} 캐시 히트 (부하 절감!)")
+                return data.get("current_price", 0.0)
+
         try:
             stock = yf.Ticker(ticker)
             if is_market_closed: return float(stock.fast_info['last_price'])
             hist = stock.history(period="1d", interval="1m", prepost=True)
-            if not hist.empty: return float(hist['Close'].iloc[-1])
-            else: return float(stock.fast_info['last_price'])
+            if not hist.empty: price = float(hist['Close'].iloc[-1])
+            else: price = float(stock.fast_info['last_price'])
+            
+            # 캐시 업데이트 (일부 데이터만이라도 동기화)
+            if price > 0:
+                KoreaInvestmentBroker._price_cache[ticker] = (now, {"current_price": price})
+            return price
         except Exception as e:
             print(f"⚠️ [야후 파이낸스] 현재가 에러, 한투 API 우회 가동: {e}")
 
@@ -428,7 +461,12 @@ class KoreaInvestmentBroker:
 
         # 2. 실제 주문 진행
         # 🚀 [V23.1] 모의/실전 호환 TR ID 동적 전환 (하드코딩 제거)
-        tr_id = self._get_tr_id("TTTT1002U" if side == "BUY" else "TTTT1006U")
+        if side == "BUY":
+            tr_id = self._get_tr_id("TTTT1002U")
+        else:
+            # 🔄 [V26.7] 모의투자 매도 TR ID 정정 (VTTT1006U -> VTTT1001U)
+            # 모의투자 미국주식 매도는 VTTT1001U를 사용해야 "지원하지 않는 방식" 에러를 피할 수 있음
+            tr_id = "VTTT1001U" if not self.is_real else "TTTT1006U"
         excg_cd = self._get_exchange_code(ticker, target_api="ORDER")
 
         # 🎯 [V22.2] 모의투자 LOC 폴백 로직
@@ -449,8 +487,10 @@ class KoreaInvestmentBroker:
         
         body = {
             "CANO": self.cano, "ACNT_PRDT_CD": self.acnt_prdt_cd, "OVRS_EXCG_CD": excg_cd,
-            "PDNO": ticker, "ORD_QTY": str(int(qty)), "OVRS_ORD_UNPR": str(final_price),
-            "ORD_SVR_DVSN_CD": "0", "ORD_DVSN": ord_dvsn 
+            "PDNO": ticker, "ORD_QTY": str(int(qty)), "OVRS_ORD_UNPR": f"{final_price:.2f}" if final_price > 0 else "0",
+            "SLL_BUY_DVSN_CD": "02" if side == "BUY" else "01",
+            "ORD_SVR_DVSN_CD": "0", 
+            "ORD_DVSN": ord_dvsn 
         }
         res = self._call_api(tr_id, "/uapi/overseas-stock/v1/trading/order", "POST", body=body)
         
@@ -664,6 +704,13 @@ class KoreaInvestmentBroker:
 
     def get_ticker_fast_data(self, ticker):
         """🚀 [V23.3] 초고속 야후 통합 수집기 (현재가/전일비/MA5/고저가 일괄 획득)"""
+        # ⚡ [V24] 클래스 레벨 공유 캐시 확인 (모의/실전 가격 통일 및 API 부하 감소)
+        now = time.time()
+        if ticker in KoreaInvestmentBroker._price_cache:
+            ts, data = KoreaInvestmentBroker._price_cache[ticker]
+            if now - ts < 5 and "ma_5day" in data: # 풀 데이터가 있을 때만 캐시 사용
+                return data
+
         try:
             stock = yf.Ticker(ticker)
             # 1. 일봉 데이터 (5일 이평선용) - 이게 가장 빠름
@@ -688,13 +735,17 @@ class KoreaInvestmentBroker:
             if day_high <= 0: day_high = curr_p
             if day_low <= 0: day_low = curr_p
 
-            return {
+            result = {
                 "current_price": curr_p,
                 "prev_close": prev_close,
                 "ma_5day": ma_5day,
                 "day_high": day_high,
                 "day_low": day_low
             }
+            
+            # ⚡ [V24] 공유 캐시 저장
+            KoreaInvestmentBroker._price_cache[ticker] = (now, result)
+            return result
         except Exception as e:
             print(f"🚨 [Yahoo-Fast] {ticker} 고속 수집 실패 (한투 우회 시도): {e}")
             # 폴백: 한투 API로 하나씩 가져오기 (안정성 유지)

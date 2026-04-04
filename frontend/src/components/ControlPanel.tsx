@@ -5,20 +5,19 @@ interface ControlPanelProps {
   ticker: string;
   config: any;
   seedVal: number;
-  mode: 'mock' | 'real'; // 🌐 [V23.1] 모드 명시화
+  holdings: number; // 📦 [V26.6] 현재 보유 수량 추가
+  mode: 'mock' | 'real';
   onClose: () => void;
   onRefresh: () => void;
 }
 
-export default function ControlPanel({ ticker, config, seedVal, mode, onClose, onRefresh }: ControlPanelProps) {
+export default function ControlPanel({ ticker, config, seedVal, holdings, mode, onClose, onRefresh }: ControlPanelProps) {
   const [seed, setSeed] = useState(seedVal || config.seed || 0);
   const [split, setSplit] = useState(config.split || 40);
   const [target, setTarget] = useState(config.target || 10);
   const [compound, setCompound] = useState(config.compound || 70);
-  const [version, setVersion] = useState(config.version || "V14");
-  const [force, setForce] = useState(false); // 🔥 [V23.1] 즉시 적용 (강제 모드)
-  const [shadowActive, setShadowActive] = useState(config.shadow?.active || false);
-  const [shadowBounce, setShadowBounce] = useState(config.shadow?.bounce || 1.5);
+  const [force, setForce] = useState(false); 
+  const [sellQty, setSellQty] = useState<string>(''); // 📉 [V26.6] 매도 수량 상태
   const [loading, setLoading] = useState(false);
 
   const api = axios.create({ baseURL: '/api' });
@@ -31,10 +30,25 @@ export default function ControlPanel({ ticker, config, seedVal, mode, onClose, o
         api.post('/settings/split', { ticker, value: split, mode }),
         api.post('/settings/target', { ticker, value: target, mode }),
         api.post('/settings/compound', { ticker, value: compound, mode }),
-        api.post('/settings/version', { ticker, value: version, mode }),
-        api.post('/settings/shadow', { ticker, active: shadowActive, bounce: shadowBounce, mode }),
       ]);
-      await api.get(`/refresh?mode=${mode}`); // 트리거 생성
+      await api.get(`/refresh?mode=${mode}`);
+      setTimeout(() => {
+        onRefresh();
+        onClose();
+      }, 800);
+    } catch (e) {
+      console.error(e);
+      setLoading(false);
+    }
+  };
+
+  const handleManualExec = async () => {
+    // 🔔 [V26.6] 사용자 피드백 반영: 확인 창 추가
+    if (!window.confirm(`[${ticker}] 수동 즉시 매수를 실행하시겠습니까? (잠금 해제 및 다음 사이클 집행)\n\n※ 매수는 시장 상황에 따라 다음 엔진 회전 때 최적가로 집행됩니다.`)) return;
+    setLoading(true);
+    try {
+      await api.post(`/action/exec`, { ticker, mode });
+      alert(`[${ticker}] 즉시 매수 요청이 성공적으로 전송되었습니다.`);
       setTimeout(() => {
         onRefresh();
         onClose();
@@ -45,16 +59,27 @@ export default function ControlPanel({ ticker, config, seedVal, mode, onClose, o
     }
   };
 
-  const handleAction = async (actionPath: string) => {
-    if (!window.confirm(`[${ticker}] 정말 실행하시겠습니까?`)) return;
+  const handleManualSell = async () => {
+    const qty = parseInt(sellQty);
+    if (!qty || qty <= 0) {
+      alert("매도 수량을 입력해주세요.");
+      return;
+    }
+    if (qty > holdings) {
+      if (!window.confirm(`입력한 수량(${qty})이 현재 보유량(${holdings})보다 많습니다. 계속하시겠습니까?`)) return;
+    }
+
+    // 🔔 [V26.6] 사용자 피드백 반영: 확인 창 추가
+    if (!window.confirm(`[${ticker}] ${qty}주를 즉시 수동 매도하시겠습니까?\n\n※ 매도는 현재가(매수1호가)로 즉시 주문이 전송됩니다.`)) return;
+    
     setLoading(true);
     try {
-      await api.post(`/action/${actionPath}`, { ticker, mode });
-      await api.get(`/refresh?mode=${mode}`);
+      await api.post(`/action/sell`, { ticker, qty, mode });
+      alert(`[${ticker}] ${qty}주 매도 주문이 성공적으로 접수되었습니다.`);
       setTimeout(() => {
         onRefresh();
         onClose();
-      }, 1500);
+      }, 1000);
     } catch (e) {
       console.error(e);
       setLoading(false);
@@ -62,201 +87,161 @@ export default function ControlPanel({ ticker, config, seedVal, mode, onClose, o
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fade-in">
-      <div className="bg-[#121214] border border-[#27272a] rounded-2xl w-full max-w-md overflow-hidden shadow-2xl relative">
-        {/* Header */}
-        <div className="p-4 border-b border-[#27272a] flex justify-between items-center bg-gradient-to-r from-gray-900 to-[#121214]">
-          <h2 className="text-xl font-bold tracking-wider text-gray-100 flex items-center">
-            <span className="text-blue-500 mr-2">⚙️</span> {ticker} <span className="text-xs text-gray-500 ml-2 font-light">QUANT SETTINGS</span>
-          </h2>
-          <button onClick={onClose} className="text-gray-500 hover:text-white transition-colors">✕</button>
+    <div className="animate-fade-in mt-4 border border-[#27272a] bg-[#121214] rounded-2xl py-5 px-5 overflow-hidden shadow-2xl relative">
+      {/* 🏷️ [V26.8] 상단 헤더 및 닫기 버튼 (완벽한 겹침 방지 레이아웃) */}
+      <div className="flex justify-between items-center mb-6 pb-4 border-b border-[#27272a]">
+        <div className="flex flex-col">
+          <h3 className="text-sm font-black text-blue-400 tracking-tighter flex items-center gap-2">
+            <span className="text-xs">⚙️</span> {ticker} 설정 제어
+          </h3>
+          <p className="text-[0.6rem] text-gray-500 mt-0.5 font-bold uppercase tracking-widest">Manual Control Center</p>
         </div>
+        <button 
+          onClick={onClose}
+          className="text-gray-400 hover:text-white transition-all p-1.5 bg-[#18181b] rounded-lg border border-[#3f3f46] flex-shrink-0 shadow-sm active:scale-90"
+          title="닫기"
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M6 18L18 6M6 6l12 12" />
+          </svg>
+        </button>
+      </div>
 
-        {/* Scrollable Body */}
-        <div className="p-5 space-y-6 max-h-[70vh] overflow-y-auto">
-          {/* Capital Control */}
-          <div className="space-y-3">
-            <div className="text-xs font-bold text-gray-500 uppercase tracking-widest border-b border-[#27272a] pb-1">Capital Control</div>
-            <div className="flex justify-between items-center">
-              <div className="flex flex-col">
-                <label className="text-sm font-medium text-gray-300">운용 시드머니 ($)</label>
-                <span className="text-[0.65rem] text-gray-500">
-                  현재 현장 투입액: <span className="text-blue-400">${seedVal.toLocaleString()}</span>
-                </span>
-              </div>
-              <input 
-                type="number" 
-                value={seed} 
-                onChange={(e) => setSeed(Number(e.target.value))}
-                className="bg-[#18181b] border border-[#27272a] rounded-lg px-3 py-1.5 text-right w-32 focus:outline-none focus:border-blue-500 transition-colors"
-              />
-            </div>
-            
-            <div className="flex items-center gap-2 mt-1">
-              <input 
-                type="checkbox" 
-                id="forceApply" 
-                checked={force} 
-                onChange={(e) => setForce(e.target.checked)}
-                className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500 bg-[#18181b]"
-              />
-              <label htmlFor="forceApply" className="text-[0.7rem] text-gray-400 cursor-pointer hover:text-gray-200 transition-colors">
-                ⚠️ <span className="underline decoration-dotted">즉시 적용 (강제)</span> - 매매 진행 중이라도 시드를 즉각 변경합니다.
+      <div className="w-full space-y-6">
+        {/* Capital Control */}
+        <div className="space-y-3">
+          <div className="flex justify-between items-center">
+            <div className="flex flex-col">
+              <label className="text-[0.7rem] font-black text-gray-400 uppercase tracking-widest flex items-center gap-1.5">
+                <span className="text-[0.6rem]">💰</span> 운용 시드머니 ($)
               </label>
+              <span className="text-[0.65rem] text-gray-500 mt-0.5">
+                현재 투입액: <span className="text-blue-400 font-bold">${seedVal.toLocaleString()}</span>
+              </span>
             </div>
-            {!force && (
-              <p className="text-[0.6rem] text-blue-500/70 ml-6 italic">
-                * 체크 해제 시, 현재 보유 중인 수량이 0원(졸업)이 된 시점부터 새로운 시드가 적용됩니다.
-              </p>
-            )}
+            <input 
+              type="number" 
+              value={seed} 
+              onChange={(e) => setSeed(Number(e.target.value))}
+              className="bg-[#09090b] border border-[#27272a] rounded-lg px-3 py-1.5 text-right w-28 focus:outline-none focus:border-blue-500 font-black text-white tabular-nums transition-colors"
+            />
           </div>
-
-          {/* Algo Settings */}
-          <div className="space-y-4">
-            <div className="text-xs font-bold text-gray-500 uppercase tracking-widest border-b border-[#27272a] pb-1">Algorithm Parameters</div>
-            
-            <div className="flex justify-between items-center">
-              <label className="text-sm font-medium text-gray-300 flex items-center gap-1">⏱️ 분할 횟수</label>
-              <div className="flex items-center gap-2">
-                <input type="range" min="10" max="100" step="10" value={split} onChange={(e) => setSplit(Number(e.target.value))} className="w-24 accent-blue-500" />
-                <span className="text-sm w-10 text-right">{split}회</span>
-              </div>
-            </div>
-
-            <div className="flex justify-between items-center">
-              <label className="text-sm font-medium text-gray-300 flex items-center gap-1">🎯 목표 수익률</label>
-              <div className="flex items-center gap-2">
-                <input type="range" min="5" max="30" step="1" value={target} onChange={(e) => setTarget(Number(e.target.value))} className="w-24 accent-green-500" />
-                <span className="text-sm w-10 text-right">{target}%</span>
-              </div>
-            </div>
-
-            <div className="flex justify-between items-center">
-              <label className="text-sm font-medium text-gray-300 flex items-center gap-1">💸 자동복리율</label>
-              <div className="flex items-center gap-2">
-                <input type="range" min="0" max="100" step="10" value={compound} onChange={(e) => setCompound(Number(e.target.value))} className="w-24 accent-indigo-500" />
-                <span className="text-sm w-10 text-right">{compound}%</span>
-              </div>
-            </div>
-
-            <div className="flex flex-col gap-2 pt-2 pb-2">
-              <label className="text-sm font-medium text-gray-300">엔진 버전</label>
-              <div className="grid grid-cols-1 gap-2">
-                <label className={`cursor-pointer flex flex-col p-3 rounded-xl border transition-colors ${version === 'V13' ? 'border-blue-500 bg-blue-500/10' : 'border-[#27272a] bg-[#18181b] hover:border-[#3f3f46]'}`}>
-                  <div className="flex items-center gap-2">
-                    <input type="radio" name="version" value="V13" checked={version === 'V13'} onChange={(e) => setVersion(e.target.value)} className="hidden" />
-                    <span className="font-bold text-white text-sm">💎 무한매수법 V22 (V13)</span>
-                  </div>
-                  <span className="text-[0.65rem] text-gray-400 mt-1">100% 동적분할 시스템 적용. 보수적이고 안정적인 스윙 트레이딩.</span>
-                </label>
-                <label className={`cursor-pointer flex flex-col p-3 rounded-xl border transition-colors ${version === 'V14' ? 'border-blue-500 bg-blue-500/10' : 'border-[#27272a] bg-[#18181b] hover:border-[#3f3f46]'}`}>
-                  <div className="flex items-center gap-2">
-                    <input type="radio" name="version" value="V14" checked={version === 'V14'} onChange={(e) => setVersion(e.target.value)} className="hidden" />
-                    <span className="font-bold text-white text-sm">💎 무한매수법 V22.2 (V14)</span>
-                  </div>
-                  <span className="text-[0.65rem] text-gray-400 mt-1">최신 융합 알고리즘. 하락장 방어력과 상승장 추세추종의 시너지 극대화.</span>
-                </label>
-                <label className={`cursor-pointer flex flex-col p-3 rounded-xl border transition-colors ${version === 'V24' ? 'border-indigo-500 bg-indigo-500/10' : 'border-[#27272a] bg-[#18181b] hover:border-[#3f3f46]'}`}>
-                  <div className="flex items-center gap-2">
-                    <input type="radio" name="version" value="V24" checked={version === 'V24'} onChange={(e) => setVersion(e.target.value)} className="hidden" />
-                    <span className="font-bold text-white text-sm">👤 Shadow-Strike (V24)</span>
-                  </div>
-                  <span className="text-[0.65rem] text-indigo-400/80 mt-1">16년 백테스트 검증 완료. 저점 추격 매수로 상승장 소외를 원천 차단하는 정밀 엔진.</span>
-                </label>
-
-                {/* 👤 [V24] Shadow-Strike 전용 설정 섹션 */}
-                {version === 'V24' && (
-                  <div className="mt-2 p-4 rounded-xl bg-indigo-500/5 border border-indigo-500/20 space-y-3 animate-slide-down">
-                    <div className="flex justify-between items-center">
-                      <label className="text-xs font-bold text-indigo-300 flex items-center gap-1">
-                        👤 Shadow 모드 활성화
-                      </label>
-                      <button 
-                        onClick={() => setShadowActive(!shadowActive)}
-                        className={`w-10 h-5 rounded-full transition-colors relative ${shadowActive ? 'bg-indigo-600' : 'bg-gray-700'}`}
-                      >
-                        <div className={`absolute top-1 w-3 h-3 rounded-full bg-white transition-all ${shadowActive ? 'right-1' : 'left-1'}`} />
-                      </button>
-                    </div>
-                    
-                    <div className="flex justify-between items-center">
-                      <div className="flex flex-col">
-                        <label className="text-xs font-bold text-indigo-300">눌림목 타겟 (Bounce %)</label>
-                        <p className="text-[0.6rem] text-indigo-400/60">저점 대비 반등 시 매수</p>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <input 
-                          type="range" min="0.5" max="5.0" step="0.1" 
-                          value={shadowBounce} 
-                          onChange={(e) => setShadowBounce(Number(e.target.value))} 
-                          className="w-20 accent-indigo-400" 
-                        />
-                        <span className="text-xs font-mono text-indigo-300 w-8 text-right">{shadowBounce}%</span>
-                      </div>
-                    </div>
-                    
-                    <div className="pt-1 border-t border-indigo-500/10">
-                      <p className="text-[0.6rem] text-indigo-400/80 leading-relaxed italic">
-                        * 10초 단위 실시간 트래킹: 장중 최저점이 갱신될 때마다 최적의 Shadow Price로 주문이 자동 정정됩니다.
-                      </p>
-                    </div>
-                  </div>
-                )}
-
-                <label className={`cursor-pointer flex flex-col p-3 rounded-xl border transition-colors ${version === 'V17' ? 'border-purple-500 bg-purple-500/10' : 'border-[#27272a] bg-[#18181b] hover:border-[#3f3f46]'}`}>
-                  <div className="flex items-center gap-2">
-                    <input type="radio" name="version" value="V17" checked={version === 'V17'} onChange={(e) => setVersion(e.target.value)} className="hidden" />
-                    <span className="font-bold text-white text-sm">🦇 시크릿 스나이퍼 (V17)</span>
-                  </div>
-                  <span className="text-[0.65rem] text-purple-400/80 mt-1">극단적 하방 변동성에서만 발동되는 야수 전용 공격형 매집.</span>
-                </label>
-              </div>
-            </div>
-            
-            <button 
-              onClick={handleSaveSettings} 
-              disabled={loading}
-              className="w-full mt-2 py-2.5 bg-[#27272a] hover:bg-[#3f3f46] active:scale-95 transition-all rounded-xl text-sm font-bold shadow-md border border-[#3f3f46]/50 disabled:opacity-50"
-            >
-              {loading ? '저장 중...' : '💾 설정 저장 및 적용'}
-            </button>
-          </div>
-
-          {/* Command Protocol (IPC Action) */}
-          <div className="space-y-3 pt-4 border-t border-[#27272a]">
-            <div className="text-xs font-bold text-red-500/80 uppercase tracking-widest border-b border-red-900/30 pb-1 mb-2">Command Protocol (Danger)</div>
-            
-            <div className="grid grid-cols-2 gap-3">
-              <button 
-                onClick={() => handleAction('record')}
-                disabled={loading}
-                className="flex flex-col items-center justify-center p-3 rounded-xl border border-blue-900/50 bg-blue-500/10 hover:bg-blue-500/20 active:scale-95 transition-all group"
-              >
-                <span className="text-xl mb-1 group-hover:scale-110 transition-transform">🔄</span>
-                <span className="text-[0.65rem] text-blue-300 font-bold tracking-tight text-center">증권사 실시간<br/>잔고 동기화 (복구)</span>
-              </button>
-
-              <button 
-                onClick={() => handleAction('reset')}
-                disabled={loading}
-                className="flex flex-col items-center justify-center p-3 rounded-xl border border-orange-900/50 bg-orange-500/10 hover:bg-orange-500/20 active:scale-95 transition-all group"
-              >
-                <span className="text-xl mb-1 group-hover:scale-110 transition-transform">🔓</span>
-                <span className="text-[0.65rem] text-orange-300 font-bold tracking-tight text-center">엔진 잠금 해제<br/>(에스크로 초기화)</span>
-              </button>
-            </div>
-            
-            <button 
-              onClick={() => handleAction('exec')}
-              disabled={loading}
-              className="w-full flex items-center justify-center gap-2 p-3 mt-2 rounded-xl border border-red-500/50 bg-red-900/20 hover:bg-red-900/40 hover:shadow-[0_0_15px_rgba(239,68,68,0.3)] active:scale-95 transition-all group"
-            >
-              <span className="text-xl group-hover:-translate-y-1 transition-transform">🔥</span>
-              <span className="text-sm font-bold text-red-400">알고리즘 수동 실행 (즉시 강제 체결)</span>
-            </button>
+          
+          <div className="flex items-center gap-2 mt-1">
+            <input 
+              type="checkbox" 
+              id="forceApply" 
+              checked={force} 
+              onChange={(e) => setForce(e.target.checked)}
+              className="w-4 h-4 rounded border-[#3f3f46] text-blue-600 focus:ring-blue-500 bg-[#09090b]"
+            />
+            <label htmlFor="forceApply" className="text-[0.65rem] text-gray-400 cursor-pointer hover:text-gray-200 transition-colors flex items-center gap-1">
+              ⚠️ <span className="underline decoration-dotted text-red-500/70">즉시 적용 (강제)</span> - 활동 중인 자본 즉각 변경
+            </label>
           </div>
         </div>
+
+        {/* Parameters */}
+        <div className="space-y-4 pt-4 border-t border-[#27272a]">
+          <div className="flex justify-between items-center">
+            <label className="text-[0.7rem] font-bold text-gray-400 flex items-center gap-1.5">
+              <span className="text-[0.6rem]">⏱️</span> 분할 횟수
+            </label>
+            <div className="flex items-center gap-3">
+              <input type="range" min="10" max="100" step="10" value={split} onChange={(e) => setSplit(Number(e.target.value))} className="w-20 accent-blue-500 h-1" />
+              <span className="text-xs w-8 text-right font-mono text-white font-bold">{split}회</span>
+            </div>
+          </div>
+
+          <div className="flex justify-between items-center">
+            <label className="text-[0.7rem] font-bold text-gray-400 flex items-center gap-1.5">
+              <span className="text-[0.6rem]">🎯</span> 목표 수익률
+            </label>
+            <div className="flex items-center gap-3">
+              <input type="range" min="5" max="30" step="1" value={target} onChange={(e) => setTarget(Number(e.target.value))} className="w-20 accent-green-500 h-1" />
+              <span className="text-xs w-8 text-right font-mono text-white font-bold">{target}%</span>
+            </div>
+          </div>
+
+          <div className="flex justify-between items-center">
+            <label className="text-[0.7rem] font-bold text-gray-400 flex items-center gap-1.5">
+              <span className="text-[0.6rem]">💸</span> 자동복리율
+            </label>
+            <div className="flex items-center gap-3">
+              <input type="range" min="0" max="100" step="10" value={compound} onChange={(e) => setCompound(Number(e.target.value))} className="w-20 accent-indigo-500 h-1" />
+              <span className="text-xs w-8 text-right font-mono text-white font-bold">{compound}%</span>
+            </div>
+          </div>
+        </div>
+        
+        {/* Buttons Section */}
+        <div className="pt-2 space-y-4">
+          <button 
+            onClick={handleSaveSettings} 
+            disabled={loading}
+            className="w-full py-3 bg-blue-600 hover:bg-blue-500 active:scale-[0.98] transition-all rounded-xl text-xs font-black text-white shadow-lg disabled:opacity-50 flex justify-center items-center gap-2"
+          >
+            {loading ? <div className="w-3 h-3 border-2 border-white/30 border-t-white rounded-full animate-spin"></div> : '💾 운용 설정 저장 및 창 닫기'}
+          </button>
+
+          {/* Manual Trade Area */}
+          <div className="bg-[#18181b] p-4 rounded-xl border border-[#27272a] space-y-3">
+             <button 
+                onClick={handleManualExec}
+                className="w-full py-2.5 bg-green-500/10 border border-green-500/30 text-green-400 text-xs font-black rounded-lg hover:bg-green-500/20 transition-all flex justify-center items-center gap-2"
+              >
+                🛒 수동 즉시 매수
+              </button>
+
+              <div className="space-y-2 mt-2">
+                <div className="flex flex-col gap-2">
+                  <div className="relative">
+                    <input 
+                      type="number"
+                      placeholder="매도 수량 입력"
+                      value={sellQty}
+                      onChange={(e) => setSellQty(e.target.value)}
+                      className="w-full bg-[#09090b] border border-[#27272a] rounded-lg pl-3 pr-16 py-2 text-xs text-white focus:outline-none focus:border-red-500 font-bold"
+                    />
+                    <button 
+                      onClick={() => setSellQty(holdings.toString())}
+                      className="absolute right-1.5 top-1.5 px-2 py-1 bg-[#27272a] text-[0.6rem] text-gray-300 font-bold rounded hover:text-white transition-colors border border-[#3f3f46]"
+                    >
+                      전체 선택
+                    </button>
+                  </div>
+                  <button 
+                    onClick={handleManualSell}
+                    disabled={loading || !sellQty}
+                    className="w-full py-2.5 bg-red-600 hover:bg-red-500 text-white text-xs font-black rounded-lg transition-all active:scale-[0.98] disabled:opacity-50 shadow-md shadow-red-900/20"
+                  >
+                    📉 수동 즉시 매도
+                  </button>
+                </div>
+                <div className="flex justify-between items-center px-1">
+                   <p className="text-[0.6rem] text-gray-500 italic">
+                      * 현재 보유량: <span className="text-gray-300 font-bold">{holdings}</span>주
+                   </p>
+                </div>
+              </div>
+          </div>
+        </div>
+
+        <div className="flex justify-center pt-2">
+           <button 
+            onClick={onClose} 
+            className="flex items-center gap-1.5 text-gray-500 hover:text-white text-[0.65rem] font-bold py-2 px-4 rounded-full border border-[#27272a] transition-all hover:bg-[#18181b]"
+           >
+             ✖️ 설정 도구 닫기
+           </button>
+        </div>
+
+        <p className="text-[0.55rem] text-gray-600 text-center leading-relaxed mt-4 opacity-50">
+          ※ 수동 매수/매도는 즉시 시장가 형태(매수/매도 1호가)로 집행됩니다.<br/>
+          전략 정비 및 버전 관리는 [제어] 탭에서 가능합니다.
+        </p>
       </div>
     </div>
+
   );
 }

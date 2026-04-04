@@ -10,14 +10,19 @@ export default function Dashboard({ isAutoRefresh, mode }: { isAutoRefresh: bool
   const [account, setAccount] = useState<any>(null)
   const [logs, setLogs] = useState<string[]>([]) // 📜 신규: 시스템 로그 상태
   const [syncStatus, setSyncStatus] = useState<any>(null) // 🔄 신규: 동기화 상태 피드백
+  const [tactics, setTactics] = useState<any>(null) // 🛡️ [V25] 글로벌 전술 정보
+  const [logSearch, setLogSearch] = useState('')
+  const [logDateFilter, setLogDateFilter] = useState('')
   const [loading, setLoading] = useState(true)
 
   const fetchData = async () => {
     try {
       const api = axios.create({ baseURL: '/api' })
-      const [resConf, resLedger] = await Promise.all([
+      const [resConf, resLedger, resTactics, resLogs] = await Promise.all([
         api.get(`/config?mode=${mode}`),
-        api.get(`/ledger?mode=${mode}`)
+        api.get(`/ledger?mode=${mode}`),
+        api.get(`/settings/tactics?mode=${mode}`),
+        api.get(`/logs?mode=${mode}`)
       ])
       setConfig(resConf.data.config)
       
@@ -41,10 +46,13 @@ export default function Dashboard({ isAutoRefresh, mode }: { isAutoRefresh: bool
         }
       }
 
-      // 📜 로그 데이터 가져오기
-      const resLogs = await api.get(`/logs?mode=${mode}`)
       if (resLogs.data.logs) {
-        setLogs(resLogs.data.logs.reverse()) 
+        setLogs(resLogs.data.logs) 
+      }
+
+      // 🏹 [V25] 글로벌 전술 데이터 세팅
+      if (resTactics.data.tactics) {
+        setTactics(resTactics.data.tactics)
       }
     } catch (e) {
       console.error("API 연결 실패", e)
@@ -57,10 +65,12 @@ export default function Dashboard({ isAutoRefresh, mode }: { isAutoRefresh: bool
     fetchData()
     let interval: any;
     if (isAutoRefresh) {
-      interval = setInterval(fetchData, 10000) // 10초 간격으로 단축 (빠른 피드백)
+      // 🚀 [V26.9] 반응형 폴링: 동기화 진행 중일 때는 2초마다, 평소에는 10초마다 갱신
+      const pollInterval = syncStatus?.status === 'PROCESSING' ? 2000 : 10000;
+      interval = setInterval(fetchData, pollInterval)
     }
     return () => clearInterval(interval)
-  }, [isAutoRefresh, mode])
+  }, [isAutoRefresh, mode, syncStatus?.status])
 
   if (loading) {
     return (
@@ -108,26 +118,12 @@ export default function Dashboard({ isAutoRefresh, mode }: { isAutoRefresh: bool
 
   return (
     <div className="space-y-4 animate-fade-in-up pb-10 relative">
-      {/* 🔄 [V23.5] Manual Sync Notification Toast */}
-      {syncStatus && (Date.now() / 1000 - syncStatus.timestamp < 30) && (
-        <div className={`fixed top-24 left-1/2 -translate-x-1/2 z-[100] px-4 py-2.5 rounded-2xl border shadow-2xl flex items-center gap-3 transition-all animate-pulse ${
-          syncStatus.status === 'PROCESSING' 
-          ? 'bg-blue-600/20 border-blue-500/50 text-blue-400' 
-          : 'bg-emerald-600/20 border-emerald-500/50 text-emerald-400 border-dashed'
-        }`}>
-          {syncStatus.status === 'PROCESSING' ? (
-            <div className="w-3 h-3 border-2 border-current border-t-transparent rounded-full animate-spin"></div>
-          ) : (
-            <span className="text-xs">⚡</span>
-          )}
-          <span className="text-[10px] font-black tracking-tight">{syncStatus.msg}</span>
-        </div>
-      )}
       
       {/* 📡 Market Schedule Timeline */}
       <MarketTimeline 
         marketStatus={account?.market_status || '조회 중'} 
         dstInfo={account?.dst_info || ''}
+        isSummer={account?.is_summer}
         isTradeActive={account?.is_trade_active || false}
         isReal={account?.is_real}
         taskStatus={account?.task_status || {}}
@@ -179,75 +175,112 @@ export default function Dashboard({ isAutoRefresh, mode }: { isAutoRefresh: bool
             ledgerData={ledger[ticker] || {}} 
             configData={config[ticker] || {}} 
             mode={mode}
+            tactics={tactics}
+            syncStatus={syncStatus}
             onRefresh={fetchData}
           />
         ))}
       </div>
 
-      {/* 📊 실시간 거래 알림 피드 (Trade Alert Feed) - RE-DESIGNED [V24] */}
+      {/* 📊 실시간 거래 알림 피드 (Trade Alert Feed) - V33 통일 형식 */}
       <div className="bg-[#09090b] rounded-2xl border border-[#27272a] overflow-hidden shadow-2xl mt-8">
-        <div className="flex justify-between items-center p-4 bg-[#121214] border-b border-[#27272a]">
-          <h3 className="text-white font-bold text-xs flex items-center gap-2">
+        <div className="flex flex-wrap justify-between items-center gap-2 p-4 bg-[#121214] border-b border-[#27272a]">
+          <h3 className="text-white font-bold text-xs flex items-center gap-2 whitespace-nowrap">
             <span className="text-green-500 animate-pulse">●</span> 실시간 거래 알림 피드
+            <span className="text-[0.55rem] text-gray-500 font-normal tracking-wider uppercase hidden sm:inline">(Trade Alert Feed)</span>
           </h3>
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2 flex-shrink-0">
+            <div className="flex items-center gap-2 bg-[#27272a] rounded-full px-3 py-1 border border-[#3f3f46]">
+              <input 
+                type="text" 
+                placeholder="결과 검색..." 
+                value={logSearch}
+                onChange={(e) => setLogSearch(e.target.value)}
+                className="bg-transparent text-[0.6rem] text-white outline-none w-20 focus:w-32 transition-all placeholder:text-gray-600"
+              />
+              <input 
+                type="text" 
+                placeholder="MM/DD" 
+                value={logDateFilter}
+                onChange={(e) => setLogDateFilter(e.target.value)}
+                className="bg-transparent text-[0.6rem] text-white outline-none w-10 placeholder:text-gray-600 border-l border-[#3f3f46] pl-2"
+              />
+            </div>
             <button 
               onClick={async () => {
                 if (window.confirm("거래 내역을 영구적으로 초기화하시겠습니까?")) {
                   try {
                     await axios.post('/api/logs/clear', { mode });
-                    fetchData(); // 즉시 리프레시
+                    setLogSearch('');
+                    setLogDateFilter('');
+                    fetchData();
                   } catch (e) {
                     console.error("초기화 실패:", e);
                   }
                 }
               }}
-              className="text-[0.6rem] text-gray-500 hover:text-red-400 font-bold transition-colors bg-[#27272a] px-2 py-0.5 rounded-full"
+              className="text-[0.6rem] text-gray-500 hover:text-red-400 font-bold transition-colors bg-[#27272a] px-2 py-0.5 rounded-full whitespace-nowrap"
             >
               내역 비우기
             </button>
-            <span className="text-[0.6rem] text-gray-500 font-medium tracking-tighter uppercase opacity-50">Auto-sync active</span>
           </div>
         </div>
-        <div className="p-3 max-h-72 overflow-y-auto space-y-2.5 scrollbar-none bg-gradient-to-b from-[#09090b] to-[#121214]">
-          {logs && logs.filter(log => /✅|❌|💰|익절|매수|매도|졸업|스나이퍼|🌟|💫|🚨|⚠️|🌅|🔥|🌙|📝|🔄|📡|🔔/.test(log)).length > 0 ? (
-            logs.filter(log => /✅|❌|💰|익절|매수|매도|졸업|스나이퍼|🌟|💫|🚨|⚠️|🌅|🔥|🌙|📝|🔄|📡|🔔/.test(log)).map((log, i) => {
-              const matches = log.match(/\[(.*?)\] (.*)/);
-              const time = matches ? matches[1] : '';
-              const content = matches ? matches[2] : log;
-              
-              const isError = log.includes('❌') || log.includes('⚠️') || log.includes('🚨');
-              const isProfit = log.includes('💰') || log.includes('익절') || log.includes('졸업');
-              const isAction = log.includes('매수') || log.includes('매도');
-              const isNew = i === 0;
-
-              return (
-                <div key={i} className={`group relative p-3 rounded-xl border transition-all duration-300 ${isNew ? 'ring-1 ring-green-500/20 shadow-[0_0_15px_rgba(34,197,94,0.1)]' : ''} ${
-                  isError ? 'bg-red-950/20 border-red-900/40 text-red-200' :
-                  isProfit ? 'bg-green-950/20 border-green-900/40 text-green-200' :
-                  isAction ? 'bg-blue-950/20 border-blue-900/40 text-blue-200' :
-                  'bg-[#18181b] border-[#27272a] text-gray-400'
-                }`}>
-                  {isNew && (
-                    <div className="absolute -left-1 -top-1">
-                      <span className="flex h-2 w-2">
-                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
-                        <span className="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span>
+        <div className="max-h-80 overflow-y-auto scrollbar-thin scrollbar-thumb-[#3f3f46]">
+          {logs && logs.length > 0 && typeof logs[0] === 'object' ? (
+            <table className="w-full text-left text-[0.65rem] border-collapse">
+              <thead className="sticky top-0 bg-[#18181b] border-b border-[#27272a] z-10 text-gray-500 font-bold">
+                <tr>
+                  <th className="px-3 py-2 w-12">DATE</th>
+                  <th className="px-2 py-2 w-16">TIME</th>
+                  <th className="px-2 py-2 w-20">TASK</th>
+                  <th className="px-3 py-2">SUMMARY</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-[#27272a]">
+                {logs
+                  .filter((ev: any) => {
+                    const searchStr = logSearch.toLowerCase();
+                    const dateStr = logDateFilter;
+                    return (
+                      (ev.msg?.toLowerCase().includes(searchStr) || ev.task?.toLowerCase().includes(searchStr)) &&
+                      (!dateStr || ev.date === dateStr)
+                    );
+                  })
+                  .map((ev: any, idx: number) => {
+                    // 🚀 [V33.4] 중요 거래 로그(BUY/SELL) 시각적 강조
+                    const isTrade = ev.task?.includes('BUY') || ev.task?.includes('SELL') || ev.msg?.includes('체결');
+                    return (
+                    <tr key={idx} className={`hover:bg-[#18181b]/50 transition-colors ${
+                      isTrade ? 'bg-blue-500/10 border-l border-blue-500/50 shadow-[inset_2px_0_0_0_#3b82f6]' : 
+                      idx === 0 ? 'bg-green-950/10' : ''
+                    }`}>
+                    <td className="px-3 py-2.5 text-gray-600 font-mono tracking-tighter text-[0.6rem]">{ev.date}</td>
+                    <td className="px-2 py-2.5 text-gray-500 font-mono tracking-tighter">{ev.time}</td>
+                    <td className="px-2 py-2.5">
+                      <span className={`px-1.5 py-0.5 rounded-md font-bold text-[0.55rem] ${
+                        ev.status === 'SUCCESS' ? 'text-green-500 bg-green-500/10' : 
+                        ev.status === 'ERROR' ? 'text-red-500 bg-red-500/10' : 
+                        ev.status === 'WARNING' ? 'text-yellow-500 bg-yellow-500/10' :
+                        'text-blue-500 bg-blue-500/10'
+                      }`}>
+                        {ev.task}
                       </span>
-                    </div>
-                  )}
-                  <div className="flex justify-between items-start mb-1">
-                    <span className={`text-[0.55rem] font-black uppercase tracking-widest ${isNew ? 'text-green-500' : 'opacity-40'}`}>
-                      {isNew ? 'New Alert' : 'History'}
-                    </span>
-                    <span className="text-[0.55rem] font-bold opacity-30 tabular-nums">{time || 'RECENT'}</span>
-                  </div>
-                  <p className="text-[0.7rem] font-medium leading-relaxed">
-                    {content}
-                  </p>
-                </div>
-              );
-            })
+                    </td>
+                    <td className="px-3 py-2.5 text-gray-300 font-medium">
+                      <span className="mr-1">{ev.icon}</span>{ev.msg}
+                    </td>
+                  </tr>
+                );
+              })}
+              </tbody>
+            </table>
+          ) : logs && logs.length > 0 ? (
+            /* Fallback: 기존 문자열 배열 호환 */
+            <div className="p-3 space-y-2">
+              {logs.map((log: any, i: number) => (
+                <div key={i} className="p-2.5 rounded-lg bg-[#18181b] border border-[#27272a] text-gray-400 text-[0.7rem]">{typeof log === 'string' ? log : JSON.stringify(log)}</div>
+              ))}
+            </div>
           ) : (
             <div className="flex flex-col items-center justify-center py-12 opacity-20">
               <span className="text-3xl mb-3 grayscale">🔔</span>

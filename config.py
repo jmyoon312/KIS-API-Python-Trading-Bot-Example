@@ -6,11 +6,20 @@ import json
 import os
 import datetime
 import pytz
+import logging
 import math
 import time
 import shutil
 import tempfile
 import pandas_market_calendars as mcal
+import queue
+import threading
+
+# 🔎 [V30-Unified] 알림용 비동기 로직 제거 (네이티브 가동으로 동기식 전환)
+# notification_queue = queue.Queue() - REMOVED
+
+# 🔎 [V25-Diagnostic] 설정 파일 로딩 경로 추적
+logging.warning(f"🔎 [CONFIG-TRACE] ConfigManager 모듈 로드됨: {os.path.abspath(__file__)}")
 
 try:
     from version_history import VERSION_HISTORY
@@ -53,54 +62,79 @@ class ConfigManager:
             "SNAPSHOTS": "daily_snapshots.json",
             "CAPITAL": "capital_flow.json",
             "LIVE_STATUS": "live_status.json",
+            "GLOBAL_TACTICS": "global_tactics.json", # 🛡️ [V25] 글로벌 전술 설정
+            "SHADOW_BOUNCE": "shadow_bounce.dat",   # 🌓 [V25] 전술 상세 속성 분리
             "ENGINE_STATUS": "engine_status.dat",
             "REFRESH_TRIGGER": "refresh_needed.tmp",
-            "SHADOW_CFG": "shadow_config.json", # 👤 [V24] Shadow-Strike 설정 (ON/OFF, Bounce)
-            "EVENT_LOG": "event_log.json"
+            "EVENT_LOG": "event_log.json",
+            "NOTIFICATIONS": "notifications.json"
         }
         
         self.DEFAULT_SEED = {"SOXL": 6720.0, "TQQQ": 6720.0}
         self.DEFAULT_SPLIT = {"SOXL": 40.0, "TQQQ": 40.0}
         self.DEFAULT_TARGET = {"SOXL": 12.0, "TQQQ": 10.0}
-        self.DEFAULT_COMPOUND = {"SOXL": 100.0, "TQQQ": 100.0}
+        self.DEFAULT_COMPOUND = {"SOXL": 70.0, "TQQQ": 70.0}
         self.DEFAULT_VERSION = {"SOXL": "V14", "TQQQ": "V14"}
         self.DEFAULT_PORTFOLIO_RATIO = {"SOXL": 0.55, "TQQQ": 0.45} # 🌟 [V22 패치] 100% 동적분할 기본 타겟 비중 (예비비 0%)
         
         self.DEFAULT_SNIPER_MULTIPLIER = {"SOXL": 1.0, "TQQQ": 0.9}
-        self.DEFAULT_SHADOW_BOUNCE = 1.5 # 🌟 [V24] 기본 반등 비율 (1.5%)
 
     def _get_base_dir(self):
-        """🌟 [V22.2] 현재 모드에 따른 전용 데이터 디렉토리 반환"""
-        base = "data/real" if self.is_real else "data/mock"
+        """🌟 [V33.2] 절대 경로 강제 (WSL 환경 데이터 격리 보장)"""
+        if os.name == 'nt':
+            root = "data"
+        else:
+            root = "/home/jmyoon312/data"
+        
+        base = os.path.join(root, "real" if self.is_real else "mock")
         if not os.path.exists(base):
-            os.makedirs(base, exist_ok=True)
+            try: os.makedirs(base, exist_ok=True)
+            except: pass
         return base
 
     def _ensure_dirs(self):
         """기본 디렉토리 생성 보장"""
-        if not os.path.exists("data"): os.makedirs("data")
+        root = "data"
+        if not os.path.exists(root): os.makedirs(root, exist_ok=True)
         self._get_base_dir()
 
     def _get_file_path(self, key):
         """파일명 키값에 대해 현재 모드의 절대 경로를 반환합니다."""
-        if key not in self.FILES:
-            return f"data/{key}"
-        return os.path.join(self._get_base_dir(), self.FILES[key])
+        base = self._get_base_dir()
+        root = "data"
+
+        if key in self.FILES:
+            return os.path.join(base, self.FILES[key])
+        
+        # 🧪 [V33.1] 하드코딩 레거시 대응 지점
+        if key == "MOCK_LOC_STAGING":
+            return os.path.join(base, "mock_loc_staged.json")
+            
+        # 그 외는 루트 data/ 폴더 (공용 설정 등)
+        return os.path.join(root, key)
 
     def _load_json(self, key, default=None):
         filename = self._get_file_path(key)
         if os.path.exists(filename):
             try:
                 with open(filename, 'r', encoding='utf-8') as f:
-                    return json.load(f)
+                    data = json.load(f)
+                    if data is None: 
+                        return default if default is not None else {}
+                    # 🛡️ [V23.5.1] 타입 안정성 강화: 로드된 데이터와 기본값의 타입이 다르면 기본값 반환
+                    if default is not None and type(data) != type(default):
+                        return default
+                    return data
             except Exception as e:
                 print(f"⚠️ [Config] JSON 로드 에러 ({filename}): {e}")
                 try:
+                    import shutil
                     shutil.copy(filename, filename + f".bak_{int(time.time())}")
                 except Exception as backup_e:
                     print(f"⚠️ [Config] 백업 실패: {backup_e}")
                 return default if default is not None else {}
         return default if default is not None else {}
+
 
     def get_ratio(self, ticker):
         """💰 [V24] 종목별 포트폴리오 비중 획득 (기본값: 균등 배분)"""
@@ -124,12 +158,15 @@ class ConfigManager:
                 os.makedirs(dir_name, exist_ok=True)
                 
             fd, temp_path = tempfile.mkstemp(dir=dir_name, text=True)
-            with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-                f.flush()         
-                os.fsync(fd)      
-                
-            os.replace(temp_path, filename)
+            try:
+                with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(temp_path, filename)
+            except Exception as e:
+                if os.path.exists(temp_path): os.remove(temp_path)
+                raise e
         except Exception as e:
             print(f"❌ [Config] JSON 저장 중 치명적 에러 발생 ({filename}): {e}")
             if 'temp_path' in locals() and os.path.exists(temp_path):
@@ -195,7 +232,7 @@ class ConfigManager:
             self._save_json("LOCKS", locks)
 
     def get_total_locked_cash(self, exclude_ticker=None):
-        locks = self._load_json(self.FILES["LOCKS"], {})
+        locks = self._load_json("LOCKS", {})
         total = 0.0
         for k, v in locks.items():
             if k.startswith("ESCROW_"):
@@ -204,34 +241,34 @@ class ConfigManager:
                     total += float(v)
         return total
 
-    # ==========================================================
-    # 👤 [V24] Shadow-Strike 전용 설정 메서드
-    # ==========================================================
-    def get_shadow_config(self, ticker):
-        """Shadow 모드 활성화 여부 및 반등 비율 획득"""
-        cfg = self._load_json("SHADOW_CFG", {})
-        return cfg.get(ticker, {"active": False, "bounce": self.DEFAULT_SHADOW_BOUNCE})
+    def is_locked(self, ticker, market_type):
+        locks = self._load_json("TRADE_LOCKS", {})
+        key = f"{ticker}_{market_type}"
+        return locks.get(key, False)
 
-    def set_shadow_config(self, ticker, active, bounce):
-        """Shadow 모드 설정 저장"""
-        cfg = self._load_json("SHADOW_CFG", {})
-        cfg[ticker] = {
-            "active": bool(active),
-            "bounce": float(bounce)
-        }
-        self._save_json("SHADOW_CFG", cfg)
-        self.record_event("STRATEGY", "UPDATE", f"[{ticker}] Shadow-Strike 설정 변경 (Active: {active}, Bounce: {bounce}%)")
+    def set_lock(self, ticker, market_type):
+        locks = self._load_json("TRADE_LOCKS", {})
+        key = f"{ticker}_{market_type}"
+        locks[key] = True
+        self._save_json("TRADE_LOCKS", locks)
 
-    def is_shadow_active(self, ticker):
-        return self.get_shadow_config(ticker).get("active", False)
-
-    def get_shadow_bounce(self, ticker):
-        return self.get_shadow_config(ticker).get("bounce", self.DEFAULT_SHADOW_BOUNCE)
+    def clear_lock(self, ticker):
+        locks = self._load_json("TRADE_LOCKS", {})
+        keys_to_del = [k for k in locks if k.startswith(f"{ticker}_")]
+        for k in keys_to_del:
+            del locks[k]
+        self._save_json("TRADE_LOCKS", locks)
 
     def get_absolute_t_val(self, ticker, actual_qty, actual_avg_price):
-        seed = self.get_seed(ticker)
-        split = self.get_split_count(ticker)
-        one_portion = seed / split if split > 0 else 1
+        seed = float(self.get_seed(ticker))
+        # 🎯 [V24] 시드 0 방어 로직 (시드 설정 누락 시 기본값 1000달러 기준 보정)
+        if seed <= 0: seed = 1000.0
+        
+        split = float(self.get_split_count(ticker))
+        if split <= 0: split = 40.0
+        
+        one_portion = seed / split
+        # 🎯 [V24] T값 이상 폭주 방어 (정상적인 1분량 기준 t_val 계산)
         t_val = (actual_qty * actual_avg_price) / one_portion if one_portion > 0 else 0.0
         return round(t_val, 4), one_portion
 
@@ -433,13 +470,14 @@ class ConfigManager:
                     rem_cash += amt
                     
         avg_price = total_invested / holdings if holdings > 0 else 0.0
-        t_val = (holdings * avg_price) / base_portion if base_portion > 0 else 0.0
+        # 🎯 [V24] V14 상태 계산 시에도 절대 T값 로직과 일치시킴
+        t_val, _ = self.get_absolute_t_val(ticker, holdings, avg_price)
             
         if holdings > 0:
             safe_denom = max(1.0, split - t_val)
             current_budget = rem_cash / safe_denom
         else:
-            current_budget = base_portion
+            current_budget = seed / split
             t_val = 0.0
             
         return max(0.0, round(t_val, 4)), max(0.0, current_budget), max(0.0, rem_cash)
@@ -614,6 +652,13 @@ class ConfigManager:
                 if eval_val > 0:
                     current_valuation["ticker_eval"][t] = round(eval_val, 2)
 
+        # 🛡️ [Bug Fix] holdings_value가 0이면 live_status에서 합산 시도 (자산 표시 버그 수정)
+        if current_valuation.get("holdings", 0) <= 0 and current_valuation.get("ticker_eval"):
+            h_sum = sum(current_valuation["ticker_eval"].values())
+            if h_sum > 0:
+                current_valuation["holdings"] = round(h_sum, 2)
+                current_valuation["total"] = current_valuation["cash"] + current_valuation["holdings"]
+
         # 성과 지표 계산
         pos_profits = [h.get('profit', 0) for h in history if h.get('profit', 0) > 0]
         neg_profits = [h.get('profit', 0) for h in history if h.get('profit', 0) < 0]
@@ -678,30 +723,15 @@ class ConfigManager:
             "cycles": self.get_cycle_analytics(), # 사이클 분석 데이터 추가
             "periodical": self.get_periodical_analytics(),
             "tax": self.calculate_tax_estimation(),
-            "events": self.get_recent_events(limit=15)
+            "events": self.get_recent_events(limit=1000) # [V26.5] 상세 기록 조회를 위해 1000개로 한도 대폭 확장
         }
 
-    def record_event(self, task_name, status, message, details=None):
-        """자율 주행 엔진의 개별 작업 결과를 기록합니다 (상황실 로그용)."""
-        events = self._load_json("EVENT_LOG", [])
-        
-        # 최신 100개까지만 유지 (대기열 관리)
-        if len(events) > 100:
-            events = events[-100:]
-            
-        est = pytz.timezone('US/Eastern')
-        now = datetime.datetime.now(est).strftime('%H:%M:%S')
-        
-        events.append({
-            "time": now,
-            "task": task_name,
-            "status": status, # "SUCCESS", "ERROR", "PENDING"
-            "msg": message,
-            "details": details
-        })
-        self._save_json("EVENT_LOG", events)
+    def clear_events(self):
+        """🧹 [V26.5] 일일 사이클 시작 시 이전 운영 기록을 초기화합니다."""
+        self._save_json("EVENT_LOG", [])
+        self._last_logs = {} # 캐시 초기화
 
-    def get_recent_events(self, limit=10):
+    def get_recent_events(self, limit=1000):
         """최근 실행된 작업 로그를 반환합니다."""
         events = self._load_json("EVENT_LOG", [])
         return events[-limit:] if events else []
@@ -825,13 +855,15 @@ class ConfigManager:
         return periodical
 
     def calculate_tax_estimation(self):
-        """올해 발생한 수익을 기반으로 미국 주식 양도소득세(22%)를 추산합니다."""
+        """🚀 [V29.7] 미국 주식 양도소득세(국내 고정 22%) 추산 엔진"""
         history = self.get_history()
         this_year = str(datetime.datetime.now().year)
         
-        yearly_profit = sum(h.get('profit', 0) for h in history if h.get('end_date', '').startswith(this_year))
+        # 올해 귀속분 수익 합산
+        yearly_profit = sum(h.get('profit', 0) for h in history if str(h.get('end_date', '')).startswith(this_year))
         
-        # 기본 공제액 (약 $2,000 / 250만원 가정)
+        # 국내 기준 기본 공제액 (250만원 / 약 $1,900~$2,000)
+        # 사용자 요청에 따라 비율은 22% 고정
         allowance = 2000.0
         taxable = max(0, yearly_profit - allowance)
         estimated_tax = taxable * 0.22
@@ -841,8 +873,142 @@ class ConfigManager:
             "total_profit": round(yearly_profit, 2),
             "allowance": allowance,
             "taxable_profit": round(taxable, 2),
-            "estimated_tax": round(estimated_tax, 2)
+            "estimated_tax": round(estimated_tax, 2),
+            "tax_rate": 0.22
         }
+
+    def get_ledger_stats(self):
+        """📊 [V29.7] 장부 요약 통계 산출 (프론트엔드 위젯용)"""
+        history = self.get_history()
+        active_ledger = self.get_ledger()
+        
+        # 1. 실현 손익 (졸업 내역 기준)
+        total_realized_profit = sum(h.get('profit', 0) for h in history)
+        total_revenue = sum(h.get('revenue', 0) for h in history)
+        total_invested = sum(h.get('invested', 0) for h in history)
+        
+        wins = [h for h in history if h.get('profit', 0) > 0]
+        losses = [h for h in history if h.get('profit', 0) <= 0]
+        
+        win_rate = (len(wins) / len(history) * 100) if history else 0
+        
+        # 2. 미실현 손익 (활성 대시보드 참고)
+        # live_status.json에서 현재가 기준 평가금액 합산
+        live_status = self._load_json("LIVE_STATUS", {})
+        unrealized_profit = 0
+        active_value = 0
+        
+        if "tickers" in live_status:
+            for t, info in live_status["tickers"].items():
+                qty = info.get("qty", 0)
+                avg = info.get("avg_price", 0)
+                curr = info.get("current_price", 0)
+                if qty > 0:
+                    unrealized_profit += (curr - avg) * qty
+                    active_value += curr * qty
+
+        # 3. 세금 추산
+        tax_info = self.calculate_tax_estimation()
+        
+        return {
+            "total_realized_profit": round(total_realized_profit, 2),
+            "total_revenue": round(total_revenue, 2),
+            "total_invested": round(total_invested, 2),
+            "win_rate": round(win_rate, 1),
+            "unrealized_profit": round(unrealized_profit, 2),
+            "active_value": round(active_value, 2),
+            "total_cycles": len(history),
+            "tax_liability": tax_info["estimated_tax"],
+            "net_profit": round(total_realized_profit - tax_info["estimated_tax"], 2)
+        }
+
+    def export_ledger_excel(self, output_path):
+        """📁 [V29.7] 전문가급 엑셀 리포트 생성 (Pandas + openpyxl)"""
+        import pandas as pd
+        
+        history = self.get_history()
+        stats = self.get_ledger_stats()
+        
+        # 1. 요약 시트 데이터 준비
+        summary_data = {
+            "항목": ["총 실현 손익 (누적)", "총 투자 원금", "총 회수 금액", "총 졸업 횟수", "승률 (%)", "예상 세금 (22%)", "세후 순이익"],
+            "금액/수치": [
+                f"${stats['total_realized_profit']:,.2f}",
+                f"${stats['total_invested']:,.2f}",
+                f"${stats['total_revenue']:,.2f}",
+                f"{stats['total_cycles']}회",
+                f"{stats['win_rate']}%",
+                f"${stats['tax_liability']:,.2f}",
+                f"${stats['net_profit']:,.2f}"
+            ]
+        }
+        df_summary = pd.DataFrame(summary_data)
+        
+        # 2. 상세 내역 시트 데이터 준비
+        detailed_rows = []
+        for h in history:
+            detailed_rows.append({
+                "졸업일": h.get("end_date"),
+                "종목": h.get("ticker"),
+                "투자원금": h.get("invested"),
+                "회수금액": h.get("revenue"),
+                "실현손익": h.get("profit"),
+                "수익률(%)": h.get("yield")
+            })
+        df_details = pd.DataFrame(detailed_rows)
+        
+        # 3. 엑셀 파일 작성
+        with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+            df_summary.to_excel(writer, sheet_name='투자 요약', index=False)
+            df_details.to_excel(writer, sheet_name='상세 거래 내역', index=False)
+            
+            # 스타일링 (openpyxl)
+            workbook = writer.book
+            
+            # 요약 시트 스타일
+            ws_summary = writer.sheets['투자 요약']
+            from openpyxl.styles import Font, PatternFill, Alignment
+            header_font = Font(bold=True, color="FFFFFF")
+            header_fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
+            header_alignment = Alignment(horizontal="center")
+            
+            for cell in ws_summary["1:1"]:
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.alignment = header_alignment
+
+            # 상세 시트 스타일 (수익/손실 색상 구분)
+            ws_details = writer.sheets['상세 거래 내역']
+            from openpyxl.styles import Font, Color
+            red_font = Font(color="FF0000") # 수익: 빨강
+            blue_font = Font(color="0000FF") # 손실: 파랑
+
+            for row in range(2, len(detailed_rows) + 2):
+                profit_val = ws_details.cell(row=row, column=5).value
+                if profit_val is not None:
+                    if float(profit_val) > 0:
+                        ws_details.cell(row=row, column=5).font = red_font
+                        ws_details.cell(row=row, column=6).font = red_font
+                    elif float(profit_val) < 0:
+                        ws_details.cell(row=row, column=5).font = blue_font
+                        ws_details.cell(row=row, column=6).font = blue_font
+
+            # 열 너비 자동 조정
+            for sheetname in ['투자 요약', '상세 거래 내역']:
+                ws = writer.sheets[sheetname]
+                for col in ws.columns:
+                    max_length = 0
+                    column = col[0].column_letter # Get the column name
+                    for cell in col:
+                        try:
+                            if len(str(cell.value)) > max_length:
+                                max_length = len(str(cell.value))
+                        except: pass
+                    adjusted_width = (max_length + 2)
+                    ws.column_dimensions[column].width = adjusted_width
+
+        return output_path
+
 
 
     def check_lock(self, ticker, market_type):
@@ -997,11 +1163,44 @@ class ConfigManager:
     def set_turbo_mode(self, v):
         self._save_file("TURBO", str(v))
 
-    def get_secret_mode(self):
-        return self._load_file("SECRET_MODE") == 'True'
-
     def set_secret_mode(self, v):
         self._save_file("SECRET_MODE", str(v))
+
+    # 🌓 [V23.1] 눌림목 추적 (Shadow-Strike) 연동
+    def get_shadow_strike(self):
+        val = self._load_file("SHADOW_STRIKE")
+        return val != 'False' # 기본값 ON
+
+    def set_shadow_strike(self, v):
+        self._save_file("SHADOW_STRIKE", str(v))
+
+    def get_shadow_bounce(self):
+        val = self._load_file("SHADOW_BOUNCE")
+        return float(val) if val else 1.5 # 기본값 1.5%
+
+    def set_shadow_bounce(self, v):
+        self._save_file("SHADOW_BOUNCE", str(v))
+
+    # 🎯 [V23.1] 스나이퍼 방어 (Sniper-Defense) 연동
+    def get_sniper_defense(self):
+        val = self._load_file("SNIPER_DEFENSE")
+        return val != 'False' # 기본값 ON
+    def set_sniper_defense(self, v):
+        self._save_file("SNIPER_DEFENSE", str(v))
+
+    # 🏹 [V25] 글로벌 전술 관리 (Tactical Command Center 연동)
+    def get_global_tactics(self):
+        default = {
+            "shield": False,
+            "shadow": False,
+            "turbo": False,
+            "sniper": False, 
+            "jupjup": False
+        }
+        return self._load_json("GLOBAL_TACTICS", default)
+
+    def set_global_tactics(self, tactics):
+        self._save_json("GLOBAL_TACTICS", tactics)
 
     def get_active_tickers(self):
         return self._load_json("TICKER", ["SOXL", "TQQQ"])
@@ -1048,79 +1247,89 @@ class ConfigManager:
         """🚀 [V23.1] 엔진 작동 상태 저장"""
         self._save_file("ENGINE_STATUS", "ON" if is_on else "OFF")
 
-    def get_market_phase(self):
-        """🕒 [V23.1] 현재 미국 시장 개장 상태 및 페이즈 반환"""
-        est = pytz.timezone('US/Eastern')
-        now = datetime.datetime.now(est)
-        
-        # 주말 확인 (토=5, 일=6)
-        if now.weekday() >= 5:
-            return "CLOSED (REST)"
+    def is_market_open(self):
+        """🕒 [V23.1] 현재 미국 시장 개장 상태 및 페이즈 판별 (Config 공유용)"""
+        try:
+            est = pytz.timezone('US/Eastern')
+            today = datetime.datetime.now(est)
+            # 1차: 명확한 주말은 무조건 휴장 처리 (0:월 ~ 6:일)
+            if today.weekday() >= 5: 
+                return "WEEKEND"
+                
+            nyse = mcal.get_calendar('NYSE')
+            schedule = nyse.schedule(start_date=today.date(), end_date=today.date())
             
-        # 시간 계산 (HHMM)
-        current_time = int(now.strftime("%H%M"))
-        
-        # 04:00 ~ 09:30: Pre-market (미국 동부 기준)
-        if 400 <= current_time < 930:
-            return "PRE-MARKET"
-        # 09:30 ~ 16:00: Regular session
-        elif 930 <= current_time < 1600:
-            return "REGULAR"
-        # 16:00 ~ 20:00: Post-market
-        elif 1600 <= current_time < 2000:
-            return "POST-MARKET"
-        else:
-            return "CLOSED"
+            if not schedule.empty:
+                return "OPEN"
+            else:
+                # 달력 데이터가 아예 비어있으면 진짜 공휴일
+                return "HOLIDAY"
+        except Exception as e:
+            # 패키지 구버전 등 달력 조회 에러 시, 평일이면 무조건 개장으로 강제 처리
+            print(f"⚠️ [Config] 달력 라이브러리 에러 발생. 평일이므로 강제 개장 처리합니다: {e}")
+            return "OPEN"
 
-    # 🔔 [V23.1] 알림 피드 전용 로깅 시스템 (시스템 로그와 분리)
-    def add_notification(self, level, message):
-        """🚀 [V23.1] 대시보드 알림창 전용 고가시성 알림 메시지 기록"""
-        import datetime
-        import json
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    def record_daily_snapshot(self, total_cash, holdings_value, ticker_state=None):
+        """
+        🚀 [V24 Stable] 주말/야간 데이터 보전용 통합 스냅샷
+        1. 기존 분석용 데이터(현금, 주식합계) 저장
+        2. [V24] 복구용 슬림 상태(수량, 평단, 종가, 전일종가) 병합
+        """
+        snapshots = self._load_json("SNAPSHOTS", [])
+        est = pytz.timezone('US/Eastern')
+        today = datetime.datetime.now(est).strftime('%Y-%m-%d')
         
-        # 레벨 아이콘 설정
-        icon = "📡"
-        if level.upper() == "SUCCESS": icon = "✅"
-        elif level.upper() == "ERROR": icon = "❌"
-        elif level.upper() == "WARNING": icon = "⚠️"
-        elif level.upper() == "INFO": icon = "📡"
-        elif level.upper() == "STATUS": icon = "🔔"
+        # 📊 [V24] 만약 ticker_state가 인자로 넘어오지 않았다면 live_status에서 파싱 시도
+        # 하지만 스케줄러(main.py)에서 명시적으로 넘겨주는 것이 가장 정확함
+        if ticker_state is None:
+            live_status = self._load_json("LIVE_STATUS", {})
+            ticker_state = {}
+            if "tickers" in live_status:
+                for t, info in live_status["tickers"].items():
+                    ticker_state[t] = {
+                        "qty": info.get("qty", 0),
+                        "avg_price": info.get("avg_price", 0),
+                        "current_price": info.get("current_price", 0),
+                        "prev_close": info.get("prev_close", 0)
+                    }
         
-        entry = {
-            "time": timestamp,
-            "level": level.upper(),
-            "icon": icon,
-            "message": message
+        # 성과 분석용 개별 종목 평가금 (레거시 UI 호환성 유지)
+        ticker_eval = {}
+        for t, info in ticker_state.items():
+            eval_val = info.get("qty", 0) * info.get("current_price", 0)
+            if eval_val > 0: ticker_eval[t] = round(eval_val, 2)
+        
+        if holdings_value <= 0 and ticker_eval:
+            holdings_value = sum(ticker_eval.values())
+
+        new_snap = {
+            "date": today,
+            "cash": round(total_cash, 2),
+            "holdings": round(holdings_value, 2),
+            "total": round(total_cash + holdings_value, 2),
+            "ticker_eval": ticker_eval,
+            "ticker_state": ticker_state # 🔥 [V24] 주말 복구용 핵심 데이터
         }
         
-        # 🚀 [V23.1] 모드별 로그 폴더 사용
-        log_dir = os.path.join("logs", self._get_base_dir().split('/')[-1] if self._get_base_dir() else "mock")
-        if not os.path.exists(log_dir): os.makedirs(log_dir, exist_ok=True)
-        
-        log_path = os.path.join(log_dir, "notifications.json")
-        
-        try:
-            # 파일 읽기 및 추가
-            data = []
-            if os.path.exists(log_path):
-                with open(log_path, 'r', encoding='utf-8') as f:
-                    try:
-                        data = json.load(f)
-                    except:
-                        data = []
+        idx = next((i for i, s in enumerate(snapshots) if s['date'] == today), -1)
+        if idx >= 0:
+            snapshots[idx] = new_snap
+        else:
+            snapshots.append(new_snap)
             
-            data.append(entry)
-            
-            # 최근 100개만 유지
-            if len(data) > 100:
-                data = data[-100:]
-            
-            with open(log_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-                
-        except Exception as e:
-            print(f"❌ [Notification] 저장 에러: {e}")
+        self._save_json("SNAPSHOTS", snapshots)
+        return new_snap
+
+    def get_latest_ticker_state(self):
+        """🚀 [V24 Stable] 휴면 시 대시보드 복구용 최신 박제 데이터 반환"""
+        snapshots = self._load_json("SNAPSHOTS", [])
+        if not snapshots:
+            return {}
+        # 가장 최근 날짜의 스냅샷에서 ticker_state 추출
+        last_snap = snapshots[-1]
+        return last_snap.get("ticker_state", {})
+
+
     # 🕒 [V23.1] 모의투자 LOC 에뮬레이션 전용 스테이징 시스템
     def stage_mock_loc_order(self, ticker, order):
         """🚀 [V23.1] 모의투자에서 지원하지 않는 LOC 주문을 장 마감 전 실행용으로 예약"""
@@ -1144,24 +1353,6 @@ class ConfigManager:
         self._save_json_to_path(path, [])
         logging.info("🧹 [MOCK-LOC] 모든 예약 주문이 초기화되었습니다.")
 
-    def _get_file_path(self, key):
-        """[V23.1] 파일 키에 따른 모드별 절대 경로 반환"""
-        base = self._get_base_dir()
-        
-        # 🧪 [V23.1] FILES 맵에 정의된 키는 무조건 모드별 폴더 강제 사용
-        if key in self.FILES:
-            return os.path.join(base, self.FILES[key])
-            
-        # 레거시 또는 확장용 하드코딩 맵 (계속 유지)
-        extended_files = {
-            "MOCK_LOC_STAGING": os.path.join(base, "mock_loc_staged.json"),
-        }
-        
-        if key in extended_files:
-            return extended_files[key]
-            
-        # 그 외는 루트 data/ 폴더 (공용 설정 등)
-        return os.path.join("data", key)
 
     def _load_json_from_path(self, path, default):
         if not path or not os.path.exists(path): return default
@@ -1178,3 +1369,76 @@ class ConfigManager:
             with open(path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=4)
         except: pass
+
+    # 📋 [V33] Unified Logging & Search System
+    _last_logs = {} # Throttling cache: {(category, task, msg): timestamp}
+
+    def log_event(self, category, task, status, message, details=None, is_alert=None):
+        """
+        🚀 [V33 Unified] 전체 시스템 통합 로그 기록기
+        카테고리: TRADE(매매), SCHEDULE(일정), SYSTEM(시스템), SNAPSHOT(분석)
+        상태: SUCCESS, ERROR, WARNING, INFO, STATUS, WAIT
+        """
+        import json
+        est = pytz.timezone('US/Eastern')
+        now_ny = datetime.datetime.now(est)
+        
+        # 1. 🛡️ 중복 로그 Throttling (동일 메시지 15분 내 반복 시 무시 - TRADE/ERROR 제외)
+        if category.upper() not in ['TRADE', 'ERROR']:
+            cache_key = (category.upper(), task.upper() if task else "SYSTEM", message)
+            last_time = self._last_logs.get(cache_key)
+            if last_time and (now_ny.timestamp() - last_time < 900): # 15분(900초)
+                return
+            self._last_logs[cache_key] = now_ny.timestamp()
+
+        # 2. Master Event Log 기록 (event_log.json)
+        events = self._load_json("EVENT_LOG", [])
+        if len(events) > 2000: events = events[-2000:]
+        
+        entry = {
+            "date": now_ny.strftime("%m/%d"),
+            "time": now_ny.strftime("%H:%M:%S"),
+            "category": category.upper(),
+            "task": task.upper() if task else "SYSTEM",
+            "status": status.upper(),
+            "msg": message,
+            "details": details
+        }
+        events.append(entry)
+        self._save_json("EVENT_LOG", events)
+
+        # 3. Notification Feed 기록 (유저 실시간 알림용)
+        # 🚀 [V33.5] 실시간 피드 제약: 매매/스케줄/중요 오류만 기록 (일반 시스템 로그 제외)
+        # 🚀 [V33.5] 수량 제한 제거 (사용자 수동 비우기 가능)
+        if is_alert is None:
+            is_alert = (category.upper() in ['TRADE', 'SCHEDULE', 'SYNC']) or (status.upper() in ['ERROR', 'WARNING', 'STATUS'])
+        
+        if is_alert:
+            icons = {"SUCCESS": "✅", "ERROR": "🚨", "WARNING": "⚠️", "INFO": "📡", "WAIT": "⏳", "STATUS": "🔔"}
+            notif_entry = {
+                "date": entry["date"],
+                "time": entry["time"],
+                "task": entry["task"],
+                "status": entry["status"],
+                "msg": entry["msg"],
+                "icon": icons.get(entry["status"], "📝")
+            }
+            
+            notifs = self._load_json("NOTIFICATIONS", [])
+            notifs.append(notif_entry)
+            # 🚀 [V33.5] 무제한 저장
+            self._save_json("NOTIFICATIONS", notifs)
+    
+    # [V33 Compatible] 기존 레거시 함수들 래핑
+    def record_event(self, task_name, status, message, details=None):
+        cat = "SYSTEM"
+        uname = task_name.upper() if task_name else "SYSTEM"
+        if "TRADE" in uname or "BUY" in uname or "SELL" in uname: cat = "TRADE"
+        elif uname in ["SYNC", "RESET", "PRE", "REG", "AFTER", "IDLE"]: cat = "SCHEDULE"
+        self.log_event(cat, task_name, status, message, details)
+
+    def add_notification(self, level, message, phase="NONE", sync=False):
+        cat = "SCHEDULE" if phase != "NONE" else "SYSTEM"
+        if "TRADE" in phase.upper() or "완료" in message: cat = "TRADE"
+        self.log_event(cat, phase, level, message, is_alert=True)
+

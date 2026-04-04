@@ -4,6 +4,7 @@ import axios from 'axios'
 interface MarketTimelineProps {
   marketStatus: string   // e.g. "🔥 정규장", "🌅 프리마켓", "⛔ 장마감"
   dstInfo: string        // e.g. "🌞 서머타임(17:30)", "❄️ 겨울(18:30)"
+  isSummer?: boolean     // 🆕 신규: 명시적 서머타임 플래그 (V24+ 대응)
   isTradeActive: boolean
   isReal?: boolean       // [V22.2] 실전투자 여부
   taskStatus: Record<string, { status: string, time: string }>
@@ -33,13 +34,13 @@ const SCHEDULE_WINTER = [
   { time: '07:00', label: '🧹 정리', desc: '로그 및 장부 청소', phase: 'idle' },
 ]
 
-function getCurrentPhase(marketStatus: string, now: Date, isSummer: boolean): string {
-  // 🚀 [V24] 하이라이트 원칙: 'OPEN' 상태가 아니면 매매 페이즈(pre, reg) 강조 및 동작 모니터링 표시 안함
-  if (marketStatus !== 'OPEN') return 'none'
+function getCurrentPhase(_marketStatus: string, now: Date, isSummer: boolean): string {
+  // 🚀 [V26.5 Fix] 강조 원칙: 'OPEN' 문자열에 의존하지 않고 실제 KST 시간표에 따라 하이라이트를 이동시킵니다.
+  // 미국 휴장일(WEEKEND, HOLIDAY)인 경우에도 엔진은 동기화(Sync)나 정리(Idle) 작업을 수행할 수 있으므로 시간 기반으로 표시합니다.
 
   const tot = now.getHours() * 60 + now.getMinutes()
   
-  // 스케줄 설정 (Summer/Winter 분기)
+  // 스케줄 설정 (KST 기준 분 단위 계산)
   const S = {
     sync: isSummer ? (8*60+30) : (9*60+30),
     pre: isSummer ? (17*60) : (18*60),
@@ -48,11 +49,21 @@ function getCurrentPhase(marketStatus: string, now: Date, isSummer: boolean): st
     idle: isSummer ? (6*60) : (7*60)
   }
 
-  // 🚀 [V23.3] 시간 기반 자동 하이라이트 알고리즘
-  if (tot >= S.sync && tot < S.pre) return 'sync'
-  if (tot >= S.pre && tot < S.reg) return 'pre'
-  if (tot >= S.reg || tot < S.after) return 'reg' // 자정 교차 구간
-  if (tot >= S.after && tot < S.idle) return 'after'
+  // 🚀 [V26.5] 시간 기반 자동 하이라이트 알고리즘 (UTC/EST 관계없이 KST 직관성 유지)
+  if (isSummer) {
+    if (tot >= S.sync && tot < S.pre) return 'sync'
+    if (tot >= S.pre && tot < S.reg) return 'pre'
+    if (tot >= S.reg || tot < S.after) return 'reg' 
+    if (tot >= S.after && tot < S.idle) return 'after'
+    if (tot >= S.idle && tot < S.sync) return 'idle'
+  } else {
+    // 겨울철 (Winter)
+    if (tot >= S.sync && tot < S.pre) return 'sync'
+    if (tot >= S.pre && tot < S.reg) return 'pre'
+    if (tot >= S.reg || tot < S.after) return 'reg'
+    if (tot >= S.after && tot < S.idle) return 'after'
+    if (tot >= S.idle && tot < S.sync) return 'idle'
+  }
   
   return 'none'
 }
@@ -78,7 +89,7 @@ const parseServerTime = (ts: string) => {
   }
 }
 
-export default function MarketTimeline({ marketStatus, dstInfo, isTradeActive, isReal, taskStatus }: MarketTimelineProps) {
+export default function MarketTimeline({ marketStatus, dstInfo, isSummer: propIsSummer, isTradeActive, isReal, taskStatus }: MarketTimelineProps) {
   const [localNow, setLocalNow] = useState(new Date());
   const [serverOffset, setServerOffset] = useState<number | null>(null);
   const [isSynced, setIsSynced] = useState(false);
@@ -126,7 +137,10 @@ export default function MarketTimeline({ marketStatus, dstInfo, isTradeActive, i
     return () => clearInterval(ticker);
   }, [serverOffset]);
 
-  const isSummer = dstInfo?.includes('서머') || dstInfo?.includes('17:30')
+  // 🚀 [V24] 서머타임 판별: 명시적 플래그가 있으면 우선 사용, 없으면 문자열 파싱 (하위 호환성)
+  const isSummer = typeof propIsSummer === 'boolean' 
+    ? propIsSummer 
+    : (dstInfo?.includes('서머') || dstInfo?.includes('17:30') || dstInfo?.includes('Summer'))
   const schedule = isSummer ? SCHEDULE_SUMMER : SCHEDULE_WINTER
   const effectiveNow = localNow
   const currentPhase = getCurrentPhase(marketStatus, effectiveNow, isSummer)
@@ -143,8 +157,8 @@ export default function MarketTimeline({ marketStatus, dstInfo, isTradeActive, i
         // 해당 페이즈와 관련된 키워드로 필터링 (간이 필터링)
         const taskMap: Record<string, string> = {
           'sync': 'SYNC',
-          'pre': 'RESET',
-          'reg': 'TRADE',
+          'pre': 'PRE',    // RESET -> PRE (to match log_event)
+          'reg': 'REG',    // TRADE -> REG (to match log_event)
           'after': 'SNAPSHOT',
           'idle': 'SYSTEM'
         };
@@ -307,70 +321,68 @@ export default function MarketTimeline({ marketStatus, dstInfo, isTradeActive, i
         </div>
       </div>
 
-      {/* 🚀 [V24] 페이즈 상세 기록 모달 (Situation Room Popup) */}
+      {/* 🚀 [V26.5] 페이즈 상세 기록 (Situation Room Inline View) */}
       {selectedPhase && (
-        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-fade-in">
-          <div className="bg-[#121214] border border-[#27272a] rounded-3xl w-full max-w-md shadow-2xl overflow-hidden animate-fade-in-up">
-            <div className="p-6 border-b border-[#27272a] flex justify-between items-center bg-gradient-to-r from-blue-900/10 to-transparent">
+        <div className="mt-4 border-t border-[#27272a] pt-4 animate-fade-in">
+          <div className="bg-[#09090b]/50 rounded-2xl border border-[#27272a] overflow-hidden shadow-2xl">
+            <div className="px-4 py-3 border-b border-[#27272a] flex justify-between items-center bg-gradient-to-r from-blue-900/10 to-transparent">
               <div>
-                <h4 className="text-white font-black text-lg flex items-center gap-2">
-                  {selectedPhase.label} <span className="text-xs text-gray-500 font-normal">운영 기록</span>
+                <h4 className="text-white font-black text-xs flex items-center gap-2">
+                  <span className="w-1.5 h-3 bg-blue-500 rounded-full"></span>
+                  {selectedPhase.label} <span className="text-[0.6rem] text-gray-500 font-normal">상세 운영 아카이브</span>
                 </h4>
-                <p className="text-[0.65rem] text-gray-500 mt-0.5">{selectedPhase.desc}</p>
               </div>
               <button 
                 onClick={() => setSelectedPhase(null)}
-                className="w-8 h-8 rounded-full bg-[#18181b] flex items-center justify-center text-gray-400 hover:text-white transition-colors"
+                className="text-[0.6rem] text-gray-500 hover:text-white transition-colors"
               >
-                ✕
+                닫기 ✕
               </button>
             </div>
             
-            <div className="p-6 max-h-[400px] overflow-y-auto scrollbar-thin scrollbar-thumb-[#3f3f46]">
+            <div className="max-h-[300px] overflow-y-auto scrollbar-thin scrollbar-thumb-[#3f3f46]">
               {loadingEvents ? (
-                <div className="py-12 flex flex-col items-center gap-3">
-                  <div className="w-6 h-6 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
-                  <span className="text-[0.65rem] text-gray-500">기록 아카이브 조회 중...</span>
+                <div className="py-8 flex flex-col items-center gap-2">
+                  <div className="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
+                  <span className="text-[0.6rem] text-gray-500">데이터 동기화 중...</span>
                 </div>
               ) : phaseEvents.length === 0 ? (
-                <div className="py-12 text-center">
-                  <p className="text-gray-600 text-[0.65rem]">해당 단계에서 수행된 구체적인 작업 기록이 아직 없습니다.</p>
+                <div className="py-8 text-center">
+                  <p className="text-gray-600 text-[0.6rem]">해당 단계의 상세 작업 기록이 비어있습니다.</p>
                 </div>
               ) : (
-                <div className="space-y-4">
-                  {phaseEvents.map((ev: any, i: number) => (
-                    <div key={i} className="flex gap-4 group">
-                      <div className="flex flex-col items-center">
-                        <div className={`w-2 h-2 rounded-full mt-1.5 ${
-                          ev.status === 'SUCCESS' ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.4)]' : 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.4)]'
-                        }`}></div>
-                        <div className="w-px flex-1 bg-[#27272a] mt-2 group-last:hidden"></div>
-                      </div>
-                      <div className="flex-1 pb-4">
-                        <div className="flex justify-between items-start mb-1">
-                          <span className="text-[0.65rem] font-bold text-gray-300">{ev.task}</span>
-                          <span className="text-[0.55rem] text-gray-600 font-mono">{ev.time}</span>
-                        </div>
-                        <p className="text-xs text-white/90 leading-relaxed">{ev.msg}</p>
-                        {ev.details && (
-                          <div className="mt-1.5 p-2 rounded-lg bg-[#09090b] border border-[#27272a] text-[0.6rem] text-gray-500 italic">
-                            {ev.details}
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  ))}
-                </div>
+                <table className="w-full text-left border-collapse">
+                  <thead className="sticky top-0 bg-[#0c0c0e] text-[0.55rem] text-gray-500 uppercase font-bold">
+                    <tr>
+                      <th className="px-4 py-2 border-b border-[#27272a] w-16">시간</th>
+                      <th className="px-2 py-2 border-b border-[#27272a] w-20">작업</th>
+                      <th className="px-2 py-2 border-b border-[#27272a]">내용</th>
+                      <th className="px-4 py-2 border-b border-[#27272a] w-12 text-center">상태</th>
+                    </tr>
+                  </thead>
+                  <tbody className="text-[0.65rem]">
+                    {phaseEvents.map((ev: any, i: number) => (
+                      <tr key={i} className="border-b border-[#27272a]/30 hover:bg-white/[0.02] transition-colors group">
+                        <td className="px-4 py-2 text-gray-500 font-mono text-[0.6rem] whitespace-nowrap">{ev.time}</td>
+                        <td className="px-2 py-2 text-blue-400 font-bold tracking-tighter">{ev.task}</td>
+                        <td className="px-2 py-2 text-white/90 leading-snug">
+                          {ev.msg}
+                          {ev.details && (
+                            <div className="text-[0.55rem] text-gray-500 mt-0.5 font-light italic">
+                              {ev.details}
+                            </div>
+                          )}
+                        </td>
+                        <td className="px-4 py-2 text-center">
+                          <span className={`inline-block w-1.5 h-1.5 rounded-full ${
+                            ev.status === 'SUCCESS' ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.4)]' : 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.4)]'
+                          }`}></span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
               )}
-            </div>
-            
-            <div className="p-4 bg-[#09090b]/50 border-t border-[#27272a] text-center">
-              <button 
-                onClick={() => setSelectedPhase(null)}
-                className="px-6 py-2 rounded-xl bg-[#18181b] text-gray-400 text-[0.65rem] font-bold hover:bg-[#27272a] hover:text-white transition-all shadow-lg"
-              >
-                닫기
-              </button>
             </div>
           </div>
         </div>

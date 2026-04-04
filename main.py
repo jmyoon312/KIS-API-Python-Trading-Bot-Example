@@ -18,9 +18,13 @@ from config import ConfigManager
 from broker import KoreaInvestmentBroker
 from strategy import InfiniteStrategy
 from telegram_bot import TelegramController
-import json
-import subprocess
+import signal
+import atexit
+import threading
+import uvicorn
+from web_server import app as web_app
 import sys
+import json
 
 if not os.path.exists('data'):
     os.makedirs('data')
@@ -35,33 +39,47 @@ try:
 except ValueError:
     ADMIN_CHAT_ID = None
 
-log_filename = f"logs/bot_app_{datetime.datetime.now().strftime('%Y%m%d')}.log"
+import logging.handlers
+
+log_filename = f"logs/bot_app.log" # 고정된 파일명으로 변경 (로테이션용)
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
     level=logging.INFO,
     handlers=[
-        logging.FileHandler(log_filename, encoding='utf-8'),
+        logging.handlers.TimedRotatingFileHandler(
+            log_filename, when="midnight", interval=1, backupCount=7, encoding='utf-8'
+        ),
         logging.StreamHandler()
     ]
 )
 
 def is_dst_active():
     """
-    🌞 [Universal] 미국 동부 표준시 서머타임 판별
-    pytz 라이브러리를 통해 현재 시각의 DST 여부를 판별함 (연도 무관)
+    🌞 [Universal] 미국 동부 표준시 서머타임 판별 (V24 Robust)
+    - pytz 라이브러리의 dst() 정보를 우선적으로 신뢰하며, 
+    - 오류 발생 시 3월~11월을 서머타임으로 간주하는 Fallback 로직을 유지합니다.
     """
     try:
         est = pytz.timezone('America/New_York')
         now = datetime.datetime.now(est)
-        # dst()가 0이 아니면 서머타임 적용 중
-        return now.dst().total_seconds() != 0
+        # pytz의 dst()가 timedelta(0)이 아니면 서머타임이 적용 중인 상태임
+        return now.dst() != datetime.timedelta(0)
     except Exception as e:
-        print(f"❌ [DST 판별 오류]: {e}")
-        return False
+        # 환경적 요인으로 pytz 오류 시 월 기반 Fallback (3월~11월)
+        m = datetime.datetime.now().month
+        return 3 <= m <= 11
 
 def get_target_hour():
-    # 🇺🇸 미국 본장 개장 시간 교정 (KST 기준): 22:30(여름) / 23:30(겨울)
-    return (22, "🌞 서머타임 적용(여름)") if is_dst_active() else (23, "❄️ 서머타임 해제(겨울)")
+    """
+    🇺🇸 미국 본장 개장 시간 및 시즌 정보 반환 (KST 기준)
+    - 22:30(여름) / 23:30(겨울)
+    - 리턴: (target_hour, season_msg, is_summer)
+    """
+    is_summer = is_dst_active()
+    # ⚠️ 중요: 프론트엔드 오판 방지를 위해 겨울철 메시지에서 '서머' 단어를 제거함 (원본 저장소 방식 준수)
+    msg = "🌞 서머타임(Summer)" if is_summer else "❄️ 겨울철(Winter)"
+    target_hr = 22 if is_summer else 23
+    return target_hr, msg, is_summer
 
 # 🌅 [V23.1 Dual-Core] 거래 엔진 캡슐화
 class TradingEngine:
@@ -80,6 +98,10 @@ class TradingEngine:
         
         # 텔레그램 애플리케이션 빌드
         self.app = Application.builder().token(telegram_token).build()
+        
+        # [V24] 백그라운드 발송을 위해 봇 객체 주입
+        self.bot_controller.set_bot(self.app.bot)
+        
         self._setup_handlers()
         self._setup_jobs()
 
@@ -119,7 +141,7 @@ class TradingEngine:
                     time=sync_time, days=tuple(range(7)), chat_id=self.cfg.get_chat_id(), data=app_data)
         
         # 3. 정적 스케줄링 (정규장 초기화 및 매매 시작)
-        target_hour, _ = get_target_hour()
+        target_hour, _, _ = get_target_hour()
         jq.run_daily(scheduled_force_reset, time=datetime.time(target_hour, 0, tzinfo=kst), days=(0,1,2,3,4), chat_id=self.cfg.get_chat_id(), data=app_data)
         jq.run_daily(scheduled_regular_trade, time=datetime.time(target_hour, 30, tzinfo=kst), days=(0,1,2,3,4), chat_id=self.cfg.get_chat_id(), data=app_data)
 
@@ -133,26 +155,40 @@ class TradingEngine:
         jq.run_repeating(scheduled_premarket_monitor, interval=60, chat_id=self.cfg.get_chat_id(), data=app_data)
         jq.run_repeating(scheduled_sniper_monitor, interval=60, chat_id=self.cfg.get_chat_id(), data=app_data)
         
-        # 💓 [V23.1] 정밀 시계 동기화를 위한 심장박동 분리
-        jq.run_repeating(scheduled_heartbeat, interval=10, chat_id=self.cfg.get_chat_id(), data=app_data)
+        # 💓 [V28-Unified] 모듈 통합 및 비동기 큐 도입으로 하트비트 주기를 3초로 조정 (안정성 극대화)
+        jq.run_repeating(scheduled_heartbeat, interval=3, chat_id=self.cfg.get_chat_id(), data=app_data)
+        # 정기 싱크는 10초를 유지하여 API 부하 분산 (웹 트리거 시에는 즉시 실행됨)
         jq.run_repeating(scheduled_live_sync, interval=10, chat_id=self.cfg.get_chat_id(), data=app_data)
         
-        # 5. 자정 관리 및 분석
+        # 5. 자정 관리 및 분석 (최종 확정 고정 스냅샷 포함)
         jq.run_daily(scheduled_self_cleaning, time=datetime.time(6, 0, tzinfo=kst), days=tuple(range(7)), chat_id=self.cfg.get_chat_id(), data=app_data)
-        jq.run_daily(scheduled_analytics_snapshot, time=datetime.time(6, 10, tzinfo=kst), days=tuple(range(7)), chat_id=self.cfg.get_chat_id(), data=app_data)
+        
+        # 🚀 [V24] 애프터마켓까지 종료된 뉴욕 20:05분(한국 오전 9/10시)에 최종 정산 박제
+        snapshot_time = datetime.time(9, 5, tzinfo=kst) if is_dst_active() else datetime.time(10, 5, tzinfo=kst)
+        jq.run_daily(scheduled_analytics_snapshot, time=snapshot_time, days=tuple(range(7)), chat_id=self.cfg.get_chat_id(), data=app_data)
 
     async def start(self):
         logging.info(f"🚀 [{self.mode_name}] 엔진 가동 시작...")
         await self.app.initialize()
         # 🧪 [V23.1] 엔진 기동 직후 즉각적인 데이터 동기화 수행
-        mock_ctx = type('obj', (object,), {
-            'job': type('obj', (object,), {
-                'data': {
-                    'cfg': self.cfg, 'broker': self.broker, 'strategy': self.strategy, 
-                    'bot': self.bot_controller, 'tx_lock': self.tx_lock, 'mode': self.mode_name
-                }
-            })
-        })
+        # 🚨 [V26.4 Fix] type('obj',...)은 클래스를 생성하므로 인스턴스 속성 접근 시 에러 발생.
+        # 이를 보완하기 위해 명시적인 객체 구조를 생성합니다.
+        class MockBot:
+            async def send_message(self, *args, **kwargs): pass
+        
+        class MockContext:
+            def __init__(self, data, bot):
+                self.bot = bot
+                class MockJob:
+                    def __init__(self, d): self.data = d
+                self.job = MockJob(data)
+
+        app_data = {
+            'cfg': self.cfg, 'broker': self.broker, 'strategy': self.strategy, 
+            'bot': self.bot_controller, 'tx_lock': self.tx_lock, 'mode': self.mode_name
+        }
+        mock_ctx = MockContext(app_data, MockBot())
+        
         await scheduled_heartbeat(mock_ctx)
         await scheduled_live_sync(mock_ctx)
         
@@ -164,10 +200,11 @@ class TradingEngine:
             await self.app.start()
             if self.app.updater:
                 await self.app.updater.start_polling(drop_pending_updates=True)
-            self.cfg.record_event("SYSTEM", "SUCCESS", f"[{self.mode_name}] 엔진 가동", details="텔레그램 봇(수동 폴링) 및 스케줄러 활성화 완료")
+            # 🚀 [V33 Unified] 엔진 가동 알림
+            self.cfg.log_event("SYSTEM", "INIT", "SUCCESS", f"[{self.mode_name}] 엔진 가동", details="텔레그램 봇(수동 폴링) 및 스케줄러 활성화 완료")
         except Exception as e:
             logging.error(f"🚨 [{self.mode_name}] 텔레그램 봇 가동 실패: {e}")
-            self.cfg.record_event("SYSTEM", "ERROR", f"[{self.mode_name}] 봇 기동 실패", details=str(e))
+            self.cfg.log_event("SYSTEM", "INIT", "ERROR", f"[{self.mode_name}] 봇 기동 실패", details=str(e))
         
     async def stop(self):
         logging.info(f"🛑 [{self.mode_name}] 엔진 정지 중...")
@@ -187,36 +224,17 @@ def update_task_status(mode, phase, status):
         "time": datetime.datetime.now().strftime("%H:%M")
     }
 
-# ? [V21.4 ?픽?] ?? 개장 ?별 강력 교정 (?이러브러리 ?류 ?어)
-def is_market_open():
-    try:
-        est = pytz.timezone('US/Eastern')
-        today = datetime.datetime.now(est)
-        # 1차: 명확한 주말은 무조건 휴장 처리 (0:월 ~ 6:일)
-        if today.weekday() >= 5: 
-            return "WEEKEND"
-            
-        nyse = mcal.get_calendar('NYSE')
-        schedule = nyse.schedule(start_date=today.date(), end_date=today.date())
-        
-        if not schedule.empty:
-            return "OPEN"
-        else:
-            # 달력 데이터가 아예 비어있으면 진짜 공휴일
-            return "HOLIDAY"
-    except Exception as e:
-        # 패키지 구버전 등 달력 조회 에러 시, 평일이면 무조건 개장으로 강제 처리
-        logging.error(f"⚠️ 달력 라이브러리 에러 발생. 평일이므로 강제 개장 처리합니다: {e}")
-        return "OPEN"
-
 def get_budget_allocation(cash, holdings, tickers, cfg):
     sorted_tickers = sorted(tickers, key=lambda x: 0 if x == "SOXL" else (1 if x == "TQQQ" else 2))
     allocated = {}
     force_turbo_off = False
     rem_cash = cash
     
+    # 🎯 [V25] 글로벌 전술 설정 로드
+    tactics = cfg.get_global_tactics()
+    use_shield = tactics.get("shield", False)
+    
     for tx in sorted_tickers:
-        # V22 패치: 리버스 모드 로직 폐기 및 동적 분할 예산 할당
         h = holdings.get(tx, {'qty': 0, 'avg': 0}) if holdings else {'qty': 0, 'avg': 0}
         qty = int(h['qty'])
         avg_price = float(h['avg'])
@@ -224,15 +242,22 @@ def get_budget_allocation(cash, holdings, tickers, cfg):
         t_val, _ = cfg.get_absolute_t_val(tx, qty, avg_price)
         split = cfg.get_split_count(tx)
         
-        if t_val < (split * 0.5): current_split = split
-        elif t_val < (split * 0.75): current_split = math.floor(split * 1.5)
-        elif t_val < (split * 0.9): current_split = math.floor(split * 2.0)
-        else: current_split = math.floor(split * 2.5)
+        # 🛡️ [V25] 전술 제어: 쉴드(Shield) 활성화 여부에 따른 동적 분할 적용
+        if use_shield:
+            if t_val < (split * 0.5): current_split = split
+            elif t_val < (split * 0.75): current_split = math.floor(split * 1.5)
+            elif t_val < (split * 0.9): current_split = math.floor(split * 2.0)
+            else: current_split = math.floor(split * 2.5)
+        else:
+            current_split = split
         
+        # 🎯 [V26.2] 예산 할당: 전체 현금이 아닌 해당 종목의 남은 가용 예산만 할당
         portion = cfg.get_seed(tx) / current_split if current_split > 0 else 0
+        portions_needed = max(1, current_split - t_val)
+        ticker_budget = min(rem_cash, portion * portions_needed)
             
         if rem_cash >= portion:
-            allocated[tx] = rem_cash
+            allocated[tx] = ticker_budget
             rem_cash -= portion
         else: 
             allocated[tx] = 0
@@ -302,7 +327,7 @@ async def scheduled_token_check(context):
 async def scheduled_force_reset(context):
     kst = pytz.timezone('Asia/Seoul')
     now = datetime.datetime.now(kst)
-    target_hour, _ = get_target_hour()
+    target_hour, _, _ = get_target_hour()
     
     # 🚨 [V21.4 핫픽스] 0.001초 미세 오차(Jitter) 방어선 구축 (±2분 관용 타임)
     now_minutes = now.hour * 60 + now.minute
@@ -311,7 +336,7 @@ async def scheduled_force_reset(context):
     if abs(now_minutes - target_minutes) > 2 and abs(now_minutes - target_minutes) < (24*60 - 2):
         return
         
-    if not is_market_open():
+    if context.job.data['cfg'].is_market_open() != "OPEN":
         await context.bot.send_message(chat_id=context.job.chat_id, text="⛔ <b>오늘은 미국 증시 휴장일입니다. 시스템 초기화 및 통제권을 건너뜁니다.</b>", parse_mode='HTML')
         return
     
@@ -320,27 +345,29 @@ async def scheduled_force_reset(context):
         mode = app_data['mode']
         update_task_status(mode, "pre", "running")
         
+        # 🧹 [V26.5] 일일 사이클 시작 시 이전 기록 초기화
+        app_data['cfg'].clear_events()
         app_data['cfg'].reset_locks()
         
         for t in app_data['cfg'].get_active_tickers():
             app_data['cfg'].increment_reverse_day(t)
             
         update_task_status(mode, "pre", "done")
-        app_data['cfg'].add_notification("SUCCESS", f"[{mode}] 시스템 초기화 및 매매 잠금 해제 완료")
-        app_data['cfg'].record_event("RESET", "SUCCESS", "시스템 초기입장", details=f"[{target_hour}:00] 매매 잠금 해제 및 엔진 기어 초기화")
+        # 🚀 [V33 Unified] 시스템 초기화 알림
+        app_data['cfg'].log_event("SCHEDULE", "INIT", "SUCCESS", f"[{mode}] 시스템 초기화 완료", details=f"[{target_hour}:00] 매매 잠금 해제 및 엔진 기어 초기화 완료")
         await context.bot.send_message(chat_id=context.job.chat_id, text=f"🔓 <b>[{mode}] [{target_hour}:00] 시스템 초기화 완료 (매매 잠금 해제 & 스나이퍼 장전 & 리버스 카운트 누적)</b>", parse_mode='HTML')
     except Exception as e:
         update_task_status(app_data['mode'], "pre", "error")
-        app_data['cfg'].add_notification("ERROR", f"시스템 초기화 실패: {e}")
+        app_data['cfg'].log_event("SYSTEM", "ERROR", "FAILURE", f"시스템 초기화 실패", details=str(e))
         await context.bot.send_message(chat_id=context.job.chat_id, text=f"🚨 <b>시스템 초기화 중 에러 발생:</b> {e}", parse_mode='HTML')
 
 async def scheduled_premarket_monitor(context):
-    if not is_market_open(): return
+    if context.job.data['cfg'].is_market_open() != "OPEN": return
     app_data = context.job.data
     
     kst = pytz.timezone('Asia/Seoul')
     now = datetime.datetime.now(kst)
-    target_hour, _ = get_target_hour()
+    target_hour, _, _ = get_target_hour()
     
     # 🚨 V22.2 패치: 타겟 시간(22시 또는 23시) 5시간 전(프리마켓 시작점)부터 정규장 오픈 직전까지 전체 모니터링
     start_hour = target_hour - 5
@@ -355,8 +382,10 @@ async def scheduled_premarket_monitor(context):
     # 🚨 [V21.4 핫픽스] 비동기 병목(Deadlock) 타임아웃 족쇄 
     async def _do_premarket():
         async with tx_lock:
-            cash, holdings = broker.get_account_balance()
-            if holdings is None: return 
+            # ⚡ [V27] 블로킹 호출을 비동기로 안전하게 수행
+            res_balance = await asyncio.to_thread(broker.get_account_balance)
+            if not res_balance or res_balance[1] is None: return
+            cash, holdings = res_balance
 
             for t in cfg.get_active_tickers():
                 h = holdings.get(t, {'qty': 0, 'avg': 0})
@@ -366,23 +395,26 @@ async def scheduled_premarket_monitor(context):
                 if curr_p <= 0 or prev_c <= 0: continue
                 
                 gap_pct = (curr_p - prev_c) / prev_c * 100
+                # 🛡️ [V33 Deduplication] 가격 체크 로그는 log_event 내부 Throttling에 의해 15분에 한 번만 기록됨
+                cfg.log_event("SYSTEM", "PRE", "SUCCESS", f"[{t}] 프리마켓 가격 체크", details=f"현재가: ${curr_p}, 전일종가: ${prev_c} (GAP: {gap_pct:+.2f}%)")
                 
                 # 1. 갭상승 익절 체크 (+3% 이상 갭업 & 목표 도달 여부) (보유수량 있을때만)
                 if int(h['qty']) > 0 and gap_pct >= 3.0:
                     plan = strategy.get_plan(t, curr_p, float(h['avg']), int(h['qty']), prev_c, market_type="PRE_CHECK")
                     if plan['orders']:
                         msg = f"🌅 <b>[{t}] 대박! 프리마켓 +3% 이상 갭업(+{gap_pct:.2f}%) 및 목표 달성 🎉</b>\n⚡ 본장 하락 전 차익실현을 위해 전량 프리마켓 조기 익절을 실행합니다!"
-                        broker.cancel_all_orders_safe(t)
+                        await asyncio.to_thread(broker.cancel_all_orders_safe, t)
                         all_success = True
                         for o in plan['orders']:
                             # PRE 지정가 주문(32) 활용
-                            res = broker.send_order(t, o['side'], o['qty'], o['price'], "PRE")
+                            res = await asyncio.to_thread(broker.send_order, t, o['side'], o['qty'], o['price'], "PRE")
                             err_msg = res.get('msg1')
                             is_success = res.get('rt_cd') == '0'
                             if not is_success: all_success = False
-                            msg += f"\n└ {o['desc']}: {'✅' if is_success else f'❌({err_msg})'}"
+                            msg += f"\n└ {o['desc']} {o['side']} {o['qty']}주: {'✅' if is_success else f'❌({err_msg})'}"
                             await asyncio.sleep(0.2) 
                         await context.bot.send_message(chat_id=context.job.chat_id, text=msg, parse_mode='HTML')
+                        cfg.log_event("RESET", "SUCCESS" if all_success else "ERROR", f"[{t}] 조기 익절 실행", details=msg.replace('<b>','').replace('</b>',''))
                         
                         if all_success:
                             # 텔레그램 봇의 process_sync를 호출하여 즉각 리밸런싱을 유도할 수 있도록 안내
@@ -413,24 +445,62 @@ async def scheduled_premarket_monitor(context):
                             msg = f"🦅 <b>[{t}] V22.2 프리마켓 얼리버드 스나이퍼 발동!</b>\n"
                             msg += f"📉 갭하락({gap_pct:.2f}%) 감지. 정규장 초반 반등 통계에 기반하여 본장 오픈 전 투매 구간에서 즉시 선점합니다!\n"
                             
-                            res = broker.send_order(t, "BUY", buy_qty, curr_p, "PRE")
-                            if res.get('rt_cd') == '0':
+                            res = await asyncio.to_thread(broker.send_order, t, "BUY", buy_qty, curr_p, "PRE")
+                            if res.get('rt_cd') != '0':
                                 msg += f"❌ 매수 실패: {res.get('msg1')}"
                             await context.bot.send_message(chat_id=context.job.chat_id, text=msg, parse_mode='HTML')
 
     try:
-        update_task_status(app_data['mode'], "reg", "running") # 프리마켓 감시도 광의의 개장 준비(Reg)로 취급
+        update_task_status(app_data['mode'], "pre", "running") # 프리마켓 감시도 광의의 개장 준비(Pre)로 취급
         await asyncio.wait_for(_do_premarket(), timeout=45.0)
-        update_task_status(app_data['mode'], "reg", "done")
+        update_task_status(app_data['mode'], "pre", "done")
     except asyncio.TimeoutError:
-        update_task_status(app_data['mode'], "reg", "error")
+        update_task_status(app_data['mode'], "pre", "error")
         logging.warning("⚠️ 프리마켓 감시 중 통신 지연으로 1회 건너뜀 (Deadlock 방어)")
     except Exception as e:
         update_task_status(app_data['mode'], "pre", "error")
-        cfg.add_notification("ERROR", f"🚨 프리마켓 스케줄 장애 발생: {str(e)[:50]}")
+        cfg.log_event("SCHEDULE", "PRE", "ERROR", f"프리마켓 스케줄 장애", details=str(e)[:50])
         logging.error(f"🚨 프리마켓 모니터 에러: {e}")
     finally:
-        cfg.add_notification("STATUS", "🌅 프리마켓 감시 엔진 종료")
+        pass
+
+async def fast_ui_sync(app_data):
+    """
+    ⚡ [V24 Fast-Sync] 시세/잔고 조회 없이 UI(주문계획 명칭 등)만 즉시 갱신
+    - 전략 버전 변경 시 사용자가 1초 내에 변화를 체감하도록 설계됨
+    """
+    cfg, strategy = app_data['cfg'], app_data['strategy']
+    live_file = cfg._get_file_path("LIVE_STATUS")
+    
+    if not os.path.exists(live_file): return
+
+    try:
+        with open(live_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        # 기존 데이터를 바탕으로 전략만 재계산
+        for t, info in data['tickers'].items():
+            # 기존에 저장된 가격과 정보를 그대로 사용 (API 호출 0회)
+            curr_p = info['current_price']
+            avg_p = info['avg_price']
+            qty = info['qty']
+            prev_c = info.get('prev_close', curr_p)
+            
+            # 전략 지시서 재발급 (명칭 업데이트 목적)
+            plan = strategy.get_plan(t, curr_p, avg_p, qty, prev_c)
+            
+            info['version'] = cfg.get_version(t)
+            info['orders'] = plan['orders']
+            info['slots'] = plan['slots']
+            info['process_status'] = plan['process_status']
+        
+        # 즉시 파일 쓰기 (atomic하지 않아도 UI 로딩이므로 속도 우선)
+        with open(live_file, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            
+        logging.info(f"⚡ [Web-Trigger] Fast UI Sync completed for {app_data['mode']}")
+    except Exception as e:
+        logging.error(f"❌ [FastSync] Error: {e}")
 
 async def scheduled_heartbeat(context):
     """
@@ -446,13 +516,29 @@ async def scheduled_heartbeat(context):
         # 1. 웹 트리거 감시 (잠금 해제, 강제 실행, 실시간 동기화 등)
         triggers_found = await check_web_triggers(mode, cfg, broker, strategy, cfg.get_active_tickers(), context)
         
-        # 2. 만약 '실시간 동기화(Record)' 트리거가 있었다면 즉시 sync 호출
+        # 2. 만약 '실시간 동기화(Record)' 트리거가 있었다면 즉시 처리
         if triggers_found and "record" in triggers_found:
-             logging.info(f"🔄 [{mode}] 리모컨 신호에 의해 즉시 동기화를 시작합니다.")
-             await scheduled_live_sync(context)
+             # ⚡ [V25] 레이스 컨디션 방어: 이미 동기화 중이라면 중복 실행 방지
+             if app_data.get('sync_active'):
+                 logging.info(f"🔄 [{mode}] 리모컨 신호(Record) 무시: 이미 동기화가 진행 중입니다.")
+             else:
+                 logging.info(f"🔄 [{mode}] 리모컨 신호(Record) 감지. 즉시 전체 동기화 태스크 생성.")
+                 app_data['force_live_sync'] = True
+                 asyncio.create_task(scheduled_live_sync(context))
              return
 
-        # 3. 일반적인 심박동 (타임스탬프만 갱신)
+        # 3. [V24 Stable] 휴면 기간에는 live_sync가 전담하여 상태를 관리하므로 심박동 중복 기록을 건너뜁니다.
+        m_status = cfg.is_market_open()
+        now_ny = datetime.datetime.now(pytz.timezone('America/New_York'))
+        h_m = now_ny.strftime("%H:%M")
+        # 장마감(20:01~03:59) 또는 주말/공휴일인 경우 대시보드 강제 갱신 차단
+        is_dormancy = (h_m >= "20:01" or h_m < "04:00") or (m_status in ["WEEKEND", "HOLIDAY"])
+        
+        if is_dormancy:
+            return
+
+        # 4. 일반적인 심박동 (장중/활성 기간 타임스탬프만 갱신)
+        # 🛡️ [V24.5] 레이스 컨디션 방어: 저장 직전에 최신 상태를 로드하여 외부(웹서버) 상태값 보존
         LIVE_FILE = cfg._get_file_path("LIVE_STATUS")
         live_data = {"tickers": {}}
         if os.path.exists(LIVE_FILE):
@@ -464,323 +550,474 @@ async def scheduled_heartbeat(context):
         live_data["timestamp"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         live_data["is_real"] = cfg.is_real
         
-        TEMP_FILE = LIVE_FILE + ".heartbeat.tmp"
-        with open(TEMP_FILE, 'w', encoding='utf-8') as f:
-            json.dump(live_data, f, ensure_ascii=False, indent=4)
-        os.replace(TEMP_FILE, LIVE_FILE)
+        cfg._save_json("LIVE_STATUS", live_data)
         
     except Exception as e:
         logging.error(f"💓 Heartbeat 에러: {e}")
 
 async def scheduled_live_sync(context):
     """
-    🌟 [V23.3] 데이터 엔진 실시간 동기화 (Dynamic Phase Status Mapping)
-    현재 장 상태(Pre/Reg/After)에 맞춰 타임라인 수행 상태를 실시간으로 업데이트합니다.
+    🔄 [V23.5 Master Sync] 통합 동기화 엔진 (Trading & Monitoring)
     """
-    app_data = context.job.data if hasattr(context, 'job') else context 
+    app_data = context.job.data if hasattr(context, 'job') else context
     cfg, broker, strategy, tx_lock = app_data['cfg'], app_data['broker'], app_data['strategy'], app_data['tx_lock']
     mode = app_data.get('mode', 'MOCK')
-    bot = app_data.get('bot')
     
-    kst = pytz.timezone('Asia/Seoul')
-    now_kst = datetime.datetime.now(kst)
-    now_ts = now_kst.strftime("%Y-%m-%dT%H:%M:%S+09:00")
-    current_phase = "sync" # 기본값
+    # 🛡️ [V25] 동기화 중복 방지 락
+    if app_data.get('sync_active'):
+        return
+    app_data['sync_active'] = True
+    
+    # [V25] 초기 상태값 방어구
+    sync_verified = False
+    price_verified = False
+    balance_verified = False
+    holdings = None
     
     try:
-        # 1. 현재 마켓 패이즈 사전 판별 (UI 상태 동기화용)
-        est = pytz.timezone('US/Eastern')
-        now_ny = datetime.datetime.now(est)
+        now_ny = datetime.datetime.now(pytz.timezone('America/New_York'))
+        now_ts = now_ny.strftime("%Y-%m-%d %H:%M:%S")
+        h_m = now_ny.strftime("%H:%M")
         
-        # 🌑 [V23.3 최종 방어벽] 1차: 한국 시간 기준 주말(토/일)이면 무조건 강제 종료 고정
-        if now_kst.weekday() >= 5: # 5:토, 6:일
-            status_code, current_phase, is_weekend = "CLOSE", "sync", True
-            status_text = "⛔ 주말 휴면 중"
-        else:
-            is_weekend = False
-            # 2차: 뉴욕 현지 시간 정밀 체크 (공휴일 포함)
-            nyse = mcal.get_calendar('NYSE')
-            schedule = nyse.schedule(start_date=now_ny.date(), end_date=now_ny.date())
-            status_code = "CLOSE"
-            status_text = "⛔ 장마감"
+        # 1. 시장 상태 및 시간대 판단 (뉴욕 현지 시간 기준)
+        m_status = cfg.is_market_open()
+        is_weekend_val = (m_status == "WEEKEND")
+        is_closed_val = (m_status == "HOLIDAY")
+        target_hr, season_msg, is_summer_val = get_target_hour()
+        
+        if "04:00" <= h_m < "09:30": status_code, status_text = "PRE", "🌅 프리마켓"
+        elif "09:30" <= h_m < "16:00": status_code, status_text = "REG", "🔥 정규장"
+        elif "16:00" <= h_m < "20:00": status_code, status_text = "AFTER", "🌙 애프터마켓"
+        else: status_code, status_text = "CLOSED", "🌙 장마감"
+    
+        # ⚠️ [Hard Rule] 애프터마켓(AFTER)은 모니터링은 하되, 20:01부터는 휴면으로 진입
+        is_dormancy = (status_code == "CLOSED") or (m_status in ["WEEKEND", "HOLIDAY"])
+        force_live = app_data.get('force_live_sync', False)
+        
+        if is_weekend_val: status_text = "⛔ 주말 휴면"
+        elif is_dormancy: status_text = f"💤 휴면 ({status_text})"
+    
+        # 🚀 [V26.5] 현재 패이즈에 따른 상태 실시간 업데이트
+        if not is_weekend_val:
+            kst_now = datetime.datetime.now(pytz.timezone('Asia/Seoul'))
+            is_sync_window = (kst_now.hour == 9) or (kst_now.hour == 10 and kst_now.minute < 30)
             
-            if schedule.empty:
-                status_code, status_text = "HOLIDAY", "🇺🇸 미 증시 휴장일"
-                current_phase = "sync"
+            if is_sync_window:
+                update_task_status(mode, "sync", "running")
             else:
-                m_open = schedule.iloc[0]['market_open'].astimezone(est)
-                m_close = schedule.iloc[0]['market_close'].astimezone(est)
-                
-                if m_open.replace(hour=4) <= now_ny < m_open: 
-                    status_code, status_text, current_phase = "PRE", "🌅 프리마켓", "pre"
-                elif m_open <= now_ny < m_close: 
-                    status_code, status_text, current_phase = "REG", "🔥 정규장", "reg"
-                elif m_close <= now_ny < m_close.replace(hour=20): 
-                    status_code, status_text, current_phase = "AFTER", "🌙 애프터마켓", "after"
-                else:
-                    status_code, current_phase = "CLOSE", "sync"
-
-        # 🚨 [V23.3] 오전 9시 ~ 10시 (KST) 사이는 강제 동기화 구간 (주말 포함 상시 동작)
-        is_morning_sync_window = (now_kst.hour == 9) or (now_kst.hour == 10 and now_kst.minute < 30)
-
-        # 🚀 상태 업데이트 (동기화 + 현재 패이즈)
-        if is_weekend:
-            status_code, status_text = "CLOSE", "⛔ 주말 휴면 중"
-            update_task_status(mode, "sync", "done")
-        elif is_morning_sync_window:
-            update_task_status(mode, "sync", "running")
-            status_text = "🔄 오전 동기화"
-        else:
-            # 🧹 [V23.3] 잔상 제거: 오전 시간이 아닌데 'running'인 경우 'done'으로 강제 정화
-            current_sync_status = STATUS_TRACKER.get(mode, {}).get("sync", {}).get("status")
-            if current_sync_status == "running":
-                update_task_status(mode, "sync", "done")
-        
-        if not is_weekend and current_phase != "sync":
-            update_task_status(mode, current_phase, "running")
-        
-        # 🚨 [V22.2.1] 웹앱 리모컨 (IPC 통신 브릿지)
-        TRIGGER_FILE = os.path.join(cfg._get_base_dir(), "refresh_needed.tmp")
-        if os.path.exists(TRIGGER_FILE):
-            try: os.remove(TRIGGER_FILE)
-            except: pass
-
-        # 1. 스냅샷 데이터 기초 구조 (기존 수동 동기화 상태 등 보존) [V23.5]
+                if STATUS_TRACKER.get(mode, {}).get("sync", {}).get("status") == "running":
+                    update_task_status(mode, "sync", "done")
+            
+            phase_map = {"PRE": "pre", "REG": "reg", "AFTER": "after"}
+            if status_code in phase_map:
+                p_key = phase_map[status_code]
+                current_p_status = STATUS_TRACKER.get(mode, {}).get(p_key, {}).get("status")
+                if current_p_status not in ["done", "error"]:
+                    update_task_status(mode, p_key, "running")
+    
+        # 🛡️ [V23.5 Persistence] 기존 데이터 로드
         PREV_L_FILE = cfg._get_file_path("LIVE_STATUS")
-        prev_sync_status = None
+        live_data = {"tickers": {}, "cash": 0, "holdings_value": 0}
         if os.path.exists(PREV_L_FILE):
             try:
                 with open(PREV_L_FILE, 'r', encoding='utf-8') as f:
-                    prev_data = json.load(f)
-                    prev_sync_status = prev_data.get("last_manual_sync")
+                    loaded_data = json.load(f)
+                    if isinstance(loaded_data, dict):
+                        live_data = loaded_data
             except: pass
-
-        live_data = {
-            "timestamp": now_ts,
-            "last_manual_sync": prev_sync_status, # 이전 상태 보존
-            "market_status": status_text, # 🔄 [V23.3] "데이터 갱신 중..." 대신 실제 상태 주입
-            "is_real": cfg.is_real,
-            "cash": 0, "holdings_value": 0, "tickers": {},
-            "task_status": STATUS_TRACKER.get(mode, {})
-        }
-
-        # 🚀 [V23.1] 모드별 폴더에서 명령어 트리거 확인
-        import glob
-        trigger_path = os.path.join(cfg._get_base_dir(), "trigger_*.tmp")
-        for f in glob.glob(trigger_path):
-            filename = os.path.basename(f)
-            try: os.remove(f)
-            except: pass
-            
-            chat_id = cfg.get_chat_id()
-            if filename.startswith("trigger_exec_") and bot:
-                ticker = filename.replace("trigger_exec_", "").replace(".tmp", "")
-                async def _exec_task(t, c_id):
-                    await context.bot.send_message(c_id, f"🚀 <b>[{t}] 웹앱 리모컨: 수동 강제 매매 접수</b>", parse_mode='HTML')
-                    async with tx_lock:
-                        cash, holdings = broker.get_account_balance()
-                        if holdings is None: return
-                        _, allocated_cash, force_turbo_off = get_budget_allocation(cash, holdings, cfg.get_active_tickers(), cfg)
-                        h = holdings.get(t, {'qty':0, 'avg':0})
-                        curr_p = await asyncio.to_thread(broker.get_current_price, t)
-                        prev_c = await asyncio.to_thread(broker.get_previous_close, t)
-                        ma_5day = await asyncio.to_thread(broker.get_5day_ma, t)
-                        plan = strategy.get_plan(t, curr_p, float(h['avg']), int(h['qty']), prev_c, ma_5day=ma_5day, market_type="REG", available_cash=allocated_cash.get(t,0), force_turbo_off=force_turbo_off)
-                        
-                        all_success = True
-                        for o in plan.get('core_orders', []) + plan.get('bonus_orders', []):
-                            res = broker.send_order(t, o['side'], o['qty'], o['price'], o['type'])
-                            if res.get('rt_cd') != '0': all_success = False
-                            await asyncio.sleep(0.2)
-                        
-                        if all_success and len(plan.get('core_orders', [])) > 0:
-                            cfg.set_lock(t, "REG")
-                            await context.bot.send_message(c_id, f"✅ <b>[{t}] 강제 매매 전송 완료 (잠금 처리)</b>", parse_mode='HTML')
-                asyncio.create_task(_exec_task(ticker, chat_id))
+    
+        # 🆕 [V33.6 Daily Reset] 새로운 거래일 감지 및 슬롯 초기화
+        current_ny_date = now_ny.strftime("%Y-%m-%d")
+        stored_ny_date = live_data.get("last_calc_date")
+        
+        if stored_ny_date and stored_ny_date != current_ny_date:
+            logging.info(f"🆕 [Day-Reset] New Trading Day detected ({current_ny_date}). Cleaning old slots state.")
+            for t, ticker_info in live_data.get("tickers", {}).items():
+                # 1. 주문 슬롯 초기화 (매도 완료 등 상태 제거)
+                if "slots" in ticker_info:
+                    for sid in ticker_info["slots"]:
+                        ticker_info["slots"][sid]["status"] = "WAITING"
+                        ticker_info["slots"][sid]["result"] = ""
+                # 2. 일일 잠금 해제
+                ticker_info["is_locked"] = False
                 
-            elif filename.startswith("trigger_record_") and bot:
-                ticker = filename.replace("trigger_record_", "").replace(".tmp", "")
-                async def _record_task(t, c_id):
-                    await context.bot.send_message(c_id, f"🛡️ <b>[{t}] 웹앱 리모컨: 비파괴 장부 보정 시작...</b>", parse_mode='HTML')
-                    await bot.process_auto_sync(t, c_id, context, silent_ledger=True)
-                    async with tx_lock:
-                        _, holdings = broker.get_account_balance()
-                    await bot._display_ledger(t, c_id, context, pre_fetched_holdings=holdings)
-                target_tickers = cfg.get_active_tickers() if ticker == "ALL" else [ticker]
-                for tt in target_tickers:
-                    asyncio.create_task(_record_task(tt, chat_id))
-                    
-            elif filename.startswith("trigger_reset_"):
-                ticker = filename.replace("trigger_reset_", "").replace(".tmp", "")
-                cfg.reset_lock_for_ticker(ticker)
-                cfg.set_reverse_state(ticker, False, 0)
-                cfg.clear_escrow_cash(ticker)
-                ledger_data = cfg.get_ledger()
-                changed = False
-                for lr in ledger_data:
-                    if lr.get('ticker') == ticker and lr.get('is_reverse', False):
-                        lr['is_reverse'] = False
-                        changed = True
-                if changed:
-                    cfg._save_json(cfg.FILES["LEDGER"], ledger_data)
-                asyncio.create_task(context.bot.send_message(chat_id, f"🔓 <b>[{ticker}] 웹앱 리모컨: 잠금 및 리버스 강제 해제!</b>", parse_mode='HTML'))
+        live_data["last_calc_date"] = current_ny_date
 
-
-        # 🧪 [old_main.py 레퍼런스] 수집 단계에서는 락을 잡지 않고 자유롭게 병렬 실행
-        # 🧪 [old_main.py 레퍼런스] 명확한 분기 처리에 의한 부하 분산 및 단순화
+        t_total_start = time.time()
+        
+        live_data.update({
+            "timestamp": now_ts,
+            "market_status": status_text,
+            "dst_info": season_msg,
+            "is_summer": is_summer_val,
+            "is_real": cfg.is_real,
+            "task_status": STATUS_TRACKER.get(mode, {})
+        })
+    
+        tactics_config = cfg.get_global_tactics()
+        active_tickers = cfg.get_active_tickers()
+    
+        for t in active_tickers:
+            if t not in live_data["tickers"]:
+                live_data["tickers"][t] = {"process_status": "📡 데이터 연동 중..."}
+    
         try:
-            # 🚀 [V23.3] 명령어 수신함 우선 체크 (IPC)
-            await check_web_triggers(mode, cfg, broker, strategy, cfg.get_active_tickers(), context)
-            
-            # 1. 데이터 수집 (주말 포함 상시 동작 - UI 가용성 확보)
-            cash, holdings = broker.get_account_balance()
-            if holdings is not None:
-                if is_weekend:
-                    status_text = "⛔ 주말 휴면 중"
-                else:
-                    status_text = "⛔ 장마감"
-                    if status_code == "PRE": status_text = "🌅 프리마켓"
-                    elif status_code == "REG": status_text = "🔥 정규장"
-                    elif status_code == "AFTER": status_text = "🌙 애프터마켓"
+            results = []
+            if (is_dormancy or is_weekend_val) and not force_live:
+                snapshot_state = cfg.get_latest_ticker_state()
+                active_tickers = cfg.get_active_tickers()
+                
+                total_holdings_val = 0.0
+                snapshots = cfg._load_json("SNAPSHOTS", [])
+                last_cash = snapshots[-1].get("cash", 0) if snapshots else 0
+                
+                for t in active_tickers:
+                    existing_data = live_data["tickers"].get(t, {})
+                    state = snapshot_state.get(t, {})
+                    
+                    qty = int(state.get("qty", existing_data.get("qty", 0)))
+                    avg = float(state.get("avg_price", existing_data.get("avg_price", 0)))
+                    
+                    ledger_price = float(state.get("current_price", 0))
+                    if ledger_price <= 0: ledger_price = float(existing_data.get("current_price", 0))
+                    if ledger_price <= 0: ledger_price = float(state.get("prev_close", 0))
+                    if ledger_price <= 0: ledger_price = avg
+                    
+                    prev_c = float(state.get("prev_close", 0))
+                    if prev_c <= 0: prev_c = ledger_price
+                    
+                    t_val, _ = cfg.get_absolute_t_val(t, qty, avg)
+                    split = cfg.get_split_count(t)
+                    ma5 = float(state.get("ma_5day", existing_data.get("ma_5day", 0)))
+                    d_low = float(state.get("day_low", ledger_price))
+    
+                    slots = existing_data.get("slots")
+                    if not slots or not any(s.get('qty', 0) > 0 for s in slots.values()):
+                        slots = state.get("slots", {})
+    
+                    results.append((t, {
+                        "current_price": ledger_price, "qty": qty, "avg_price": avg,
+                        "prev_close": prev_c,
+                        "profit_pct": (ledger_price - avg) / avg * 100 if avg > 0 else 0,
+                        "seed": cfg.get_active_seed(t), "ratio": cfg.get_ratio(t),
+                        "version": cfg.get_version(t),
+                        "t_val": t_val, "split": split,
+                        "ma_5day": ma5, "day_low": d_low,
+                        "process_status": status_text,
+                        "is_locked": cfg.is_locked(t, status_code),
+                        "slots": slots
+                    }))
+                    total_holdings_val += (qty * ledger_price)
                 
                 live_data.update({
-                    "market_status": status_text,
-                    "dst_info": "🌞 서머타임" if (now_ny.dst() != datetime.timedelta(0)) else "❄️ 겨울철",
-                    "cash": cash, "holdings_value": broker.last_holdings_value,
-                    "is_trade_active": status_code in ["PRE", "REG"] and not is_weekend
+                    "cash": last_cash if last_cash > 0 else live_data.get("cash", 0),
+                    "holdings_value": total_holdings_val,
+                    "is_trade_active": False
                 })
-
-                # 2. 티커별 데이터 수집 (Parallel)
-                tickers = cfg.get_active_tickers()
-                sem = asyncio.Semaphore(3)
-                
-                async def _get_ticker_data_safe(t):
-                    async with sem:
-                        h = holdings.get(t, {'qty': 0, 'avg': 0})
-                        avg = float(h['avg'])
-                        qty = int(h['qty'])
-                        try:
-                            fast_data = await asyncio.to_thread(broker.get_ticker_fast_data, t)
-                            if not fast_data: 
-                                return t, {"qty": qty, "avg_price": avg, "current_price": avg, "process_status": "📡 데이터 지연"}
-                            
-                            curr_p = fast_data['current_price']
-                            return t, {
-                                "current_price": curr_p,
-                                "qty": qty, "avg_price": avg,
-                                "prev_close": fast_data['prev_close'],
-                                "ma_5day": fast_data['ma_5day'],
-                                "day_high": fast_data['day_high'],
-                                "day_low": fast_data['day_low'],
-                                "profit_pct": (curr_p - avg) / avg * 100 if avg > 0 else 0,
-                                "seed": cfg.get_active_seed(t),
-                                "ratio": cfg.get_ratio(t),
-                                "process_status": "💤 휴면" if is_weekend else ("🔥 가동중" if status_code in ["PRE", "REG"] else "📡 감시중")
-                            }
-                        except Exception: 
-                            return t, {"qty": qty, "avg_price": avg, "current_price": avg}
-
-                # ⏱️ 30초 타임아웃 보호
-                try:
-                    async with asyncio.timeout(30):
-                        results = await asyncio.gather(*[_get_ticker_data_safe(t) for t in tickers])
-                except asyncio.TimeoutError: results = []
-
                 for t, data in results: live_data["tickers"][t] = data
-                
-                # 💰 [V24] 자산 합산 보정 로직 (증권사 API 0 반환 대비 방어 코드)
-                total_h_val = sum(float(d.get('qty', 0)) * float(d.get('current_price', 0)) for _, d in results if d.get('qty', 0) > 0)
-                if total_h_val > 0:
-                    live_data["holdings_value"] = total_h_val
-                elif live_data.get("holdings_value", 0) <= 0:
-                     live_data["holdings_value"] = total_h_val
-
-                # 🎯 전략 실행/계산 루프 (24시간 동작 - 별값/방어선 표시 유지)
-                available_cash = cash
-                if not is_weekend and status_code in ["PRE", "REG"] and not is_morning_sync_window:
-                    _, allocated_cash_map, force_turbo_off = get_budget_allocation(cash, holdings, tickers, cfg)
-                    available_cash_map = allocated_cash_map
-                else:
-                    available_cash_map = {t: 0 for t in tickers}
-                    force_turbo_off = False
-
-                for t, data in results:
-                    try:
-                        curr_p = data.get('current_price', 0)
-                        if curr_p <= 0: continue
-                        h = holdings.get(t, {'qty': 0, 'avg': 0})
-                        # 🧪 [V23.3] 주말/장마감 시에도 '계산용' plan은 생성하여 UI에 전달
-                        plan = strategy.get_plan(
-                            t, curr_p, float(h['avg']), int(h['qty']), data.get('prev_close', 0), 
-                            ma_5day=data.get('ma_5day', 0), day_low=data.get('day_low', 0), market_type=status_code, 
-                            available_cash=available_cash_map.get(t, 0), force_turbo_off=force_turbo_off
-                        )
-                        live_data["tickers"][t].update(plan)
-                        
-                        # 실제 주문은 장중에만 실행
-                        if not is_weekend and status_code in ["PRE", "REG"] and not is_morning_sync_window:
-                            # 👤 [V24 Shadow-Strike] 실시간 가격 정정 로직
-                            is_v24 = cfg.get_version(t) == "V24"
-                            is_locked = cfg.is_locked(t, status_code)
-                            
-                            if plan:
-                                orders = plan.get('core_orders', []) + plan.get('bonus_orders', [])
-                                if orders:
-                                    should_execute = False
-                                    if not is_locked:
-                                        should_execute = True
-                                    elif is_v24 and status_code == "REG":
-                                        # V24인 경우, 저점 변화에 따른 가격 변동이 있으면 기존 주문 취소 후 재주문
-                                        # (참고: strategy.py에서 day_low를 반영하므로 plan['orders'] 내 가격이 이미 최신임)
-                                        should_execute = True
-                                        async with tx_lock:
-                                            # 기존 미체결 LOC 매수 주문만 골라서 취소
-                                            broker.cancel_targeted_orders(t, side="BUY", ord_dvsn="34") 
-                                            await asyncio.sleep(0.5)
-
-                                    if should_execute:
-                                        async with tx_lock:
-                                            msg = f"🚀 <b>[{t}] {status_text} {'전략 정정' if is_locked else '전략 신규'} 주문 실행</b>\n"
-                                            for o in orders:
-                                                res = broker.send_order(t, o['side'], o['qty'], o['price'], o['type'])
-                                                msg += f"{'✅' if res.get('rt_cd')=='0' else '❌'} {o['side']} {o['qty']}주 (${o['price']})\n"
-                                                await asyncio.sleep(0.1)
-                                            cfg.set_lock(t, status_code)
-                                            if bot: await context.bot.send_message(cfg.get_chat_id(), msg, parse_mode='HTML')
-                    except Exception as e: logging.error(f"🚨 [{t}] 전략 에러: {e}")
             else:
-                live_data["market_status"] = "📡 통신 지연 (API)"
-        except Exception as e:
-            logging.error(f"⚠️ [{mode}] 동기화 루프 내부 에러: {e}")
-            live_data["market_status"] = "📡 시스템 점검 중"
-    except Exception as outer_e:
-        logging.error(f"🚨 [{mode}] 치명적 에러: {outer_e}")
-        # [V23.5] 수동 동기화 응답 업데이트 (진행 중인 경우만 피드백)
-        if live_data.get("last_manual_sync") and live_data["last_manual_sync"].get("status") == "PROCESSING":
-            live_data["last_manual_sync"]["status"] = "SUCCESS"
-            live_data["last_manual_sync"]["msg"] = "동기화 완료! 장부가 최신화되었습니다."
-            live_data["last_manual_sync"]["timestamp"] = time.time()
+                tickers = cfg.get_active_tickers()
+                sem = asyncio.Semaphore(10)
+    
+                def _safe_update_ticker(t, new_fields):
+                    if t not in live_data["tickers"]:
+                        live_data["tickers"][t] = {"process_status": "📡 동기화 중..."}
+                    live_data["tickers"][t].update(new_fields)
+    
+                async def _fetch_prices_only():
+                    async def _get_one(t):
+                        async with sem:
+                            try:
+                                fast_data = await asyncio.to_thread(broker.get_ticker_fast_data, t)
+                                if fast_data:
+                                    curr_p = fast_data['current_price']
+                                    qty = live_data["tickers"].get(t, {}).get("qty", 0)
+                                    avg = live_data["tickers"].get(t, {}).get("avg_price", 0)
+                                    t_val, _ = cfg.get_absolute_t_val(t, qty, avg)
+                                    
+                                    _safe_update_ticker(t, {
+                                        "current_price": curr_p,
+                                        "prev_close": fast_data.get('prev_close', 0),
+                                        "ma_5day": fast_data.get('ma_5day', 0),
+                                        "day_high": fast_data.get('day_high', 0),
+                                        "day_low": fast_data.get('day_low', 0),
+                                        "t_val": t_val,
+                                        "process_status": "🔥 가동중"
+                                    })
+                            except: pass
+    
+                    await asyncio.gather(*[_get_one(t) for t in tickers])
+    
+                async def _fetch_balance_only():
+                    nonlocal holdings
+                    try:
+                        res_bal = await asyncio.to_thread(broker.get_account_balance)
+                        # 🚀 [V29.8] Balance Guard: API 완전 실패 시 None 수신
+                        if res_bal[0] is None:
+                            logging.warning(f"⚠️ [{mode}] 잔고 조회 실패 (연결 지연). 기존 데이터를 보존합니다.")
+                            return
 
-        # 🛡️ [V23.3 Safety Net] 어떤 경우에도 파일 기록 (Data Stale 방어)
+                        cash, holdings_res = res_bal
+                        if holdings_res is not None:
+                            holdings = holdings_res
+                            live_data.update({
+                                "cash": cash, "holdings_value": broker.last_holdings_value,
+                            })
+                            for t in tickers:
+                                h = holdings.get(t, {'qty': 0, 'avg': 0})
+                                avg, qty = float(h['avg']), int(h['qty'])
+                                curr_p = live_data["tickers"].get(t, {}).get("current_price", 0)
+                                
+                                _safe_update_ticker(t, {
+                                    "qty": qty, "avg_price": avg,
+                                    "profit_pct": (curr_p - avg) / avg * 100 if avg > 0 and curr_p > 0 else 0
+                                })
+
+        # 🚀 [V29.7] 실시간 졸업 감지 및 자동 기록 (Auto-Graduation)
+                                # 🛡️ [V29.8] API 성공 시에만 졸업 판정 (방어적 설계)
+                                try:
+                                    ledger_qty, _, _, _ = cfg.calculate_holdings(t)
+                                    if qty == 0 and ledger_qty > 0:
+                                        logging.info(f"🎓 [Auto-Graduation] {t} 졸업 감지! (Broker Qty: 0, Ledger Qty: {ledger_qty})")
+                                        bot_ctrl = app_data.get('bot')
+                                        if bot_ctrl:
+                                            asyncio.create_task(bot_ctrl.process_auto_sync(t, cfg.get_chat_id(), context, silent_ledger=True))
+                                except Exception as g_e:
+                                    logging.error(f"⚠️ [{t}] 졸업 감지 중 에러: {g_e}")
+                    except Exception as be:
+                        logging.error(f"⚠️ [{mode}] 계좌 병렬 조회 실패: {be}")
+    
+                t_api_start = time.time()
+                await _fetch_prices_only()
+                if any(data.get('current_price', 0) > 0 for data in live_data.get('tickers', {}).values()):
+                    price_verified = True
+                
+                await _fetch_balance_only()
+                if holdings is not None:
+                    balance_verified = True
+
+                # 🎯 [Bug Fix] 모든 API 호출 완료 후 자산 최종 합산 (자산 0원 오류 방지)
+                calculated_hv = 0.0
+                for tn, tinfo in live_data.get("tickers", {}).items():
+                    qty = float(tinfo.get("qty", 0))
+                    price = float(tinfo.get("current_price", 0))
+                    if qty > 0 and price > 0:
+                        calculated_hv += qty * price
+                        # 자산 배분용 Profit PCT 보정 (가격이 늦게 뜬 경우 대비)
+                        avg = tinfo.get("avg_price", 0)
+                        if avg > 0:
+                            live_data["tickers"][tn]["profit_pct"] = (price - avg) / avg * 100
+                    
+                if calculated_hv > 0:
+                    live_data["holdings_value"] = round(calculated_hv, 2)
+                elif broker.last_holdings_value > 0:
+                    live_data["holdings_value"] = broker.last_holdings_value
+                
+                t_api_end = time.time()
+                sync_verified = price_verified or balance_verified
+    
+                live_data.update({
+                    "is_trade_active": status_code in ["PRE", "REG"] and not is_weekend_val
+                })
+    
+            tickers_for_calc = list(live_data["tickers"].keys())
+            available_cash_map = {t: 0 for t in tickers_for_calc}
+            
+            if status_code in ["PRE", "REG"] and not is_dormancy:
+                try:
+                    _, allocated_cash_map, _ = get_budget_allocation(live_data['cash'], holdings if holdings else {}, tickers_for_calc, cfg)
+                    if allocated_cash_map: available_cash_map = allocated_cash_map
+                except Exception as b_e: logging.error(f"⚠️ 예산 분배 에러: {b_e}")
+    
+            for t, data in live_data["tickers"].items():
+                try:
+                    curr_p = data.get('current_price', 0)
+                    if curr_p <= 0: continue
+                    qty = data.get('qty', 0)
+                    avg = data.get('avg_price', 0)
+                    target_cash = live_data['cash'] if is_dormancy else available_cash_map.get(t, 0)
+    
+                    # 🚀 [V29.8] Balance Guard: 잔고 데이터가 없는 경우(API 지연) 전략 계산 스킵
+                    if holdings is None and not is_dormancy:
+                        process_status = "⚠️ API 연결 지연"
+                        data["process_status"] = process_status
+                        continue
+
+                    plan = strategy.get_plan(
+                        t, curr_p, float(avg), int(qty), data.get('prev_close', 0), 
+                        ma_5day=data.get('ma_5day', 0), day_low=data.get('day_low', 0), market_type=status_code, 
+                        available_cash=target_cash, is_simulation=False, 
+                        tactics_config=tactics_config
+                    )
+                    if not plan: continue
+    
+                    new_slots = plan.get("slots", {})
+                    old_slots = data.get("slots", {})
+                    
+                    # 🛡️ [V29.8] 수량 불일치 누적 방어 (Cumulative Capping) 도입
+                    # 매칭된 인덴트: 20 spaces
+                    actual_qty = int(data.get('qty', 0))
+                    rem_sell_qty = actual_qty
+                    
+                    for sid in ["slot_1", "slot_2", "slot_3", "slot_4", "slot_5"]:
+                        # 1. 기존 슬롯의 FILLED 상태 및 값 복원 (상태 보관)
+                        if old_slots.get(sid, {}).get("status") == "FILLED":
+                            new_slots[sid]["status"] = "FILLED"
+                            new_slots[sid]["result"] = old_slots[sid].get("result", "✅체결")
+                            new_slots[sid]["price"] = old_slots[sid].get("price", 0)
+                            
+                            old_q = int(old_slots[sid].get("qty", 0))
+                            if sid in ["slot_4", "slot_5"]:
+                                allocated_q = min(rem_sell_qty, old_q)
+                                new_slots[sid]["qty"] = allocated_q
+                                rem_sell_qty -= max(0, allocated_q)
+                            else:
+                                new_slots[sid]["qty"] = old_q
+                        else:
+                            # 2. 미체결 매도 슬롯도 잔여 잔고 임계치 적용
+                            if sid in ["slot_4", "slot_5"]:
+                                plan_q = int(new_slots[sid].get("qty", 0))
+                                allocated_q = min(rem_sell_qty, plan_q)
+                                new_slots[sid]["qty"] = allocated_q
+                                rem_sell_qty -= max(0, allocated_q)
+                    
+                    plan["slots"] = new_slots
+                    # 🛡️ [V29.8] 🛠️ 중요: 슬롯 업데이트 후 주문 리스트 재동기화 (수량 불일치 최종 방어)
+                    # FILLED 상태가 아닌 주문만 재구성하여 거래소로 전송
+                    plan["orders"] = [o for sid, o in new_slots.items() if o.get("qty", 0) > 0 and o.get("status") != "FILLED"]
+                    
+                    live_data["tickers"][t].update(plan)
+                    
+                    is_trade_active = live_data.get("is_trade_active", False)
+                    if is_trade_active and not cfg.is_locked(t, status_code):
+                        orders = plan.get('orders', [])
+                        if orders:
+                            async with tx_lock:
+                                msg = f"🚀 <b>[{t}] {status_code} 전략 주문 실행</b>\n"
+                                for o in orders:
+                                    # 🚀 [V25] 모의투자 LOC 에뮬레이션: 즉시 전송 대신 스테이징
+                                    if not broker.is_real and o.get('type') == 'LOC':
+                                        cfg.stage_mock_loc_order(t, o)
+                                        msg += f"🕒 [MOCK-LOC 예약 완료] {o['desc']} {o['qty']}주\n"
+                                        continue
+                                        
+                                    # 🛑 [MOCK-PRE 방어] 모의투자는 프리마켓(PRE) 주문을 원천 거부하므로 발송 차단 (스팸 방지)
+                                    if not broker.is_real and status_code == "PRE":
+                                        msg += f"⚠️ [MOCK-PRE] {o['desc']} {o['qty']}주: 모의 프리장 불가 (대기)\n"
+                                        continue
+
+                                    res = broker.send_order(t, o['side'], o['qty'], o['price'], o['type'])
+                                    is_success = (res.get('rt_cd') == '0')
+                                    sid = f"slot_{o.get('slot_id', 1)}"
+                                    if is_success and sid in live_data["tickers"][t]["slots"]:
+                                        live_data["tickers"][t]["slots"][sid]["status"] = "FILLED"
+                                    msg += f"{'✅' if is_success else '❌'} {o['desc']} {o['qty']}주\n"
+                                    
+                                    # 🔔 [V33.1] 실시간 거래 이벤트 기록 (상황실 피드 + 이벤트 로그)
+                                    trade_status = "SUCCESS" if is_success else "WARNING"
+                                    trade_detail = f"{o['side']} {o['qty']}주 @ ${o['price']:.2f} ({o.get('type','LIMIT')})"
+                                    # 🚀 [V33 Unified] 체결 알림 (log_event 하나로 통합 기록 및 전송)
+                                    cfg.log_event("TRADE", "TRADE", trade_status, f"[{t}] {o['side']} {o['qty']}주 체결{'완료' if is_success else '실패'}", details=trade_detail)
+
+                                cfg.set_lock(t, status_code)
+                                if bot: await bot.send_message(cfg.get_chat_id(), msg, parse_mode='HTML')
+                except: pass
+            
+            t_calc_end = time.time()
+    
+        except Exception as inner_e:
+            logging.error(f"🚨 [{mode}] 내부 작업 루프 에러: {inner_e}")
+    
+        # 최종 파일 기록
         try:
             L_FILE = cfg._get_file_path("LIVE_STATUS")
-            with open(L_FILE + ".tmp", 'w', encoding='utf-8') as f:
-                json.dump(live_data, f, ensure_ascii=False, indent=4)
-            os.replace(L_FILE + ".tmp", L_FILE)
+            if os.path.exists(L_FILE):
+                try:
+                    with open(L_FILE, 'r', encoding='utf-8') as f:
+                        disk_data = json.load(f)
+                        if disk_data.get("last_manual_sync", {}).get("status") == "PROCESSING":
+                           if sync_verified:
+                               live_data["last_manual_sync"] = {"status": "SUCCESS", "msg": "동기화 완료", "timestamp": time.time()}
+                           else:
+                               live_data["last_manual_sync"] = {"status": "ERROR", "msg": "API 지연", "timestamp": time.time()}
+                        elif "last_manual_sync" in disk_data:
+                           live_data["last_manual_sync"] = disk_data["last_manual_sync"]
+                except: pass
+            cfg._save_json("LIVE_STATUS", live_data)
+            t_save_end = time.time()
+            
+            # 🚀 [PERF] 지연 원인 판독용 통합 로그
+            t_total = (time.time() - t_total_start)
+            t_api = (t_api_end - t_api_start) if 't_api_start' in locals() else 0
+            t_calc = (t_calc_end - t_api_end) if 't_calc_end' in locals() else 0
+            t_save = (t_save_end - t_calc_end) if 't_save_end' in locals() else 0
+            logging.info(f"💾 [PERF] {mode} Sync: Total {t_total:.2f}s [API:{t_api:.2f}s, Calc:{t_calc:.2f}s, Save:{t_save:.2f}s]")
+
+            if app_data.get('force_live_sync'):
+                app_data['force_live_sync'] = False
+                # 🚀 [V28.1] 수동 갱신 시에는 큐를 우회하여 즉시 기록 (UI 즉각 반영 보장)
+                cfg.log_event("SYNC", "SYNC", "SUCCESS", "수동 데이터 동기화 완료")
             update_task_status(mode, "sync", "done")
-            if current_phase != "sync": update_task_status(mode, current_phase, "done")
         except: pass
+    
+    finally:
+        app_data['sync_active'] = False
 
 async def check_web_triggers(mode, cfg, broker, strategy, tickers, context):
     """🚀 [V23.3] 명령어 수신함: 웹 대시보드에서 보낸 명령 파일(.tmp)을 감시 및 처리"""
     import glob
     base_dir = cfg._get_base_dir()
+    triggered = []
     
     # 1. 수동 실행 (Force Exec: 현재 사이클에서 즉시 실행 유도)
     for f_path in glob.glob(os.path.join(base_dir, "trigger_exec_*.tmp")):
         ticker = os.path.basename(f_path).replace("trigger_exec_", "").replace(".tmp", "")
         logging.info(f"🔥 [Web-Trigger] {ticker} 수동 알고리즘 강제 실행 명령 수신!")
         cfg.reset_lock_for_ticker(ticker) # 잠금 해제하여 즉시 주문 나가게 함
+        try: os.remove(f_path)
+        except: pass
+
+    # 1.5. 수동 즉시 매도 (Manual Instant Sell)
+    for f_path in glob.glob(os.path.join(base_dir, "trigger_sell_*_*.tmp")):
+        # trigger_sell_TICKER_QTY.tmp
+        parts = os.path.basename(f_path).replace(".tmp", "").split("_")
+        if len(parts) >= 4:
+            ticker = parts[2]
+            try:
+                qty = int(parts[3])
+                logging.info(f"💥 [Web-Trigger] {ticker} {qty}주 수동 즉시 매도 명령 수신!")
+                
+                # 즉시 매도를 위해 현재 매수 1호가 조회
+                bid_p = await asyncio.to_thread(broker.get_bid_price, ticker)
+                if bid_p <= 0:
+                    # 호가 조회 실패 시 현재가로 대체
+                    bid_p = await asyncio.to_thread(broker.get_current_price, ticker)
+                
+                if bid_p > 0:
+                    # 🛡️ [V26.8] 수동 매도 신뢰성 강화: 기존 미체결 매도 주문 강제 취소 (잔고 확보)
+                    unfilled = broker.get_unfilled_orders_detail(ticker)
+                    # SLL_BUY_DVSN_CD: 01=Sell, 02=Buy (정정된 기준 적용)
+                    existing_sells = [o for o in unfilled if o.get('sll_buy_dvsn_cd') == '01']
+                    if existing_sells:
+                        logging.info(f"🔓 [Manual-Sell] {ticker} 기존 매도 주문 {len(existing_sells)}건 발견. 자동 취소 후 진행합니다.")
+                        for so in existing_sells:
+                            broker.cancel_order(ticker, so.get('odno'))
+                            time.sleep(0.3)
+                        time.sleep(0.5)
+
+                    res = broker.send_order(ticker, "SELL", qty, bid_p, "LIMIT")
+                    if res.get('rt_cd') == '0':
+                        msg = f"📉 <b>[{ticker}] 수동 즉시 매도 성공</b>\n수량: {qty}주, 단가: ${bid_p:.2f}"
+                        cfg.log_event("TRADE", "SUCCESS", "MANUAL_SELL", f"[{ticker}] 수동 즉시 매도 성공", details=f"{qty}주 @ ${bid_p:.2f}")
+                    else:
+                        msg = f"❌ <b>[{ticker}] 수동 즉시 매도 실패</b>\n사유: {res.get('msg1')}"
+                        cfg.log_event("TRADE", "ERROR", "MANUAL_SELL", f"[{ticker}] 수동 즉시 매도 실패", details=res.get('msg1'))
+                    
+                    try: await context.bot.send_message(cfg.get_chat_id(), msg, parse_mode='HTML')
+                    except: pass
+            except Exception as e:
+                logging.error(f"🚨 수동 매도 처리 중 오류: {e}")
+        
         try: os.remove(f_path)
         except: pass
 
@@ -872,7 +1109,7 @@ async def switch_trading_mode(context, new_mode):
         await context.bot.send_message(chat_id=context.job.chat_id, text=f"✅ <b>[Hot-Plug] 매매 모드 전환 완료!</b>\n현재부터 <b>{new_mode_str}</b> 환경에서 모든 로직이 가동됩니다.", parse_mode='HTML')
 
 async def scheduled_sniper_monitor(context):
-    if not is_market_open(): return
+    if context.job.data['cfg'].is_market_open() != "OPEN": return
     
     est = pytz.timezone('US/Eastern')
     now_est = datetime.datetime.now(est)
@@ -1026,6 +1263,7 @@ async def scheduled_sniper_monitor(context):
                             msg += f"🎯 <b>매수 방어선을 해제하고 최적 단가 ${actual_buy_price:.2f}에 즉시 낚아채어 체결을 완료</b>했습니다!\n"
                             msg += "🔫 당일 하방(매수) 스나이퍼 활동만을 종료하며, 상방(익절) 감시는 계속됩니다."
                             await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='HTML')
+                            cfg.log_event("TRADE", "SUCCESS", "SNIPER_BUY", f"[{t}] 스나이퍼 매수 성공 💥", details=f"단가: ${actual_buy_price:.2f}, {trigger_reason}")
                             continue
 
                         now_ts = time.time()
@@ -1105,6 +1343,7 @@ async def scheduled_sniper_monitor(context):
                         msg += f"🎯 실시간 매수 1호가(${bid_price:.2f})가 목표가(${target_price:.2f})를 돌파하여 <b>실제 단가 ${actual_sell_price:.2f}에 전량 강제 익절</b> 처리했습니다.\n"
                         msg += "🔫 당일 상방(매도) 스나이퍼 활동을 완전 종료합니다."
                         await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='HTML')
+                        cfg.log_event("TRADE", "SUCCESS", "SNIPER_SELL", f"[{t}] 스나이퍼 익절 성공 🔥", details=f"단가: ${actual_sell_price:.2f}, 목표가: ${target_price:.2f}")
                         continue
                         
                     now_ts = time.time()
@@ -1290,13 +1529,15 @@ async def scheduled_mock_loc_execution(context):
         
     msg += f"\n\n🏁 총 {success_count}건 매매 성공. 모의투자 종가 매매가 완료되었습니다."
     cfg.clear_staged_mock_loc_orders()
-    cfg.record_event("MOCK-LOC", "SUCCESS", f"종가 매매 {success_count}건 실행 완료")
+    cfg.log_event("MOCK-LOC", "SUCCESS", "EXEC", f"종가 매매 {success_count}건 실행 완료")
     await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='HTML')
 
 async def scheduled_regular_trade(context):
+    if context.job.data['cfg'].is_market_open() != "OPEN":
+        return
     kst = pytz.timezone('Asia/Seoul')
     now = datetime.datetime.now(kst)
-    target_hour, _ = get_target_hour()
+    target_hour, _, _ = get_target_hour()
     chat_id = context.job.chat_id
     
     # ±2분 이상 차이나면 오작동 방지를 위해 중단
@@ -1312,7 +1553,7 @@ async def scheduled_regular_trade(context):
     app_data = context.job.data
     cfg, broker, strategy, tx_lock = app_data['cfg'], app_data['broker'], app_data['strategy'], app_data['tx_lock']
     latest_version = cfg.get_latest_version()
-    cfg.add_notification("STATUS", f"🔥 [{target_hour}:30] 정규장 주문 스케줄 실행 ({latest_version})")
+    cfg.log_event("STATUS", "REG", "START", f"🔥 [{target_hour}:30] 정규장 주문 스케줄 실행 ({latest_version})")
     await context.bot.send_message(chat_id=chat_id, text=f"🌃 <b>[{target_hour}:30] 다이내믹 스노우볼 {latest_version} 정규장 주문을 준비합니다.</b>", parse_mode='HTML')
     
     async def _do_regular_trade():
@@ -1366,17 +1607,17 @@ async def scheduled_regular_trade(context):
                 if not msgs[t]: continue
                 if all_success[t] and len(plans[t].get('core_orders', [])) > 0:
                     cfg.set_lock(t, "REG")
-                    cfg.add_notification("SUCCESS", f"[{t}] 정규장 필수 주문 체결 시도 완료 (잠금)")
+                    cfg.log_event("TRADE", "SUCCESS", "REG", f"[{t}] 정규장 필수 주문 체결 시도 완료 (잠금)")
                     msgs[t] += "\n🔒 <b>필수 주문 정상 전송 완료 (잠금 설정됨)</b>"
                 elif not all_success[t]:
-                    cfg.add_notification("WARNING", f"[{t}] 일부 필수 주문 전송 실패 확인")
+                    cfg.log_event("TRADE", "WARNING", "REG", f"[{t}] 일부 필수 주문 전송 실패 확인")
                     msgs[t] += "\n⚠️ <b>일부 필수 주문 실패 (매매 잠금 보류)</b>"
                 else:
                     cfg.set_lock(t, "REG")
-                    cfg.add_notification("SUCCESS", f"[{t}] 보너스 줍줍 주문 전송 완료")
+                    cfg.log_event("TRADE", "SUCCESS", "REG", f"[{t}] 보너스 줍줍 주문 전송 완료")
                     msgs[t] += "\n🔒 <b>보너스 줍줍 주문만 전송 완료 (잠금 설정됨)</b>"
                 
-                cfg.record_event("TRADE", "SUCCESS" if all_success[t] else "WARNING", f"[{t}] 정규장 주문 집행", 
+                cfg.log_event("TRADE", "SUCCESS" if all_success[t] else "WARNING", "REG", f"[{t}] 정규장 주문 집행", 
                                    details=f"결과: {len(plans[t].get('core_orders', []))}건 전송 ({'성공' if all_success[t] else '일부실패'})")
                 await context.bot.send_message(chat_id=chat_id, text=msgs[t], parse_mode='HTML')
 
@@ -1386,7 +1627,7 @@ async def scheduled_regular_trade(context):
         update_task_status(app_data['mode'], "reg", "done")
     except Exception as e:
         update_task_status(app_data['mode'], "reg", "error")
-        cfg.add_notification("ERROR", f"❌ 정규장 매매 엔진 오류: {str(e)[:50]}")
+        cfg.log_event("SYSTEM", "ERROR", "FAILURE", f"정규장 매매 엔진 오류", details=str(e)[:50])
         logging.error(f"🚨 정규장 매매 에러: {e}")
 
 async def scheduled_auto_sync_summer(context):
@@ -1411,15 +1652,14 @@ async def run_auto_sync(context, time_str):
         if res == "SUCCESS": success_tickers.append(t)
     
     if success_tickers:
-        cfg.add_notification("SUCCESS", f"장부 자동 동기화 완료 ({', '.join(success_tickers)})")
-        cfg.record_event("SYNC", "SUCCESS", f"자동 동기화 완료 ({len(success_tickers)}종목)")
+        # 🚀 [V33 Unified] 동기화 알림 통합
+        cfg.log_event("SCHEDULE", "SYNC", "SUCCESS", f"장부 자동 동기화 완료 ({len(success_tickers)}종목)")
         async with context.job.data['tx_lock']:
             _, holdings = context.job.data['broker'].get_account_balance()
         await bot._display_ledger(success_tickers[0], chat_id, context, message_obj=status_msg, pre_fetched_holdings=holdings)
     else:
-        cfg.add_notification("INFO", "장부 자동 동가화 시도 (변경 사항 없음)")
-        cfg.record_event("SYNC", "SUCCESS", "자동 동기화 (변경사항 없음)")
-        await status_msg.edit_text(f"📝 <b>[{time_str}] 장부 동가화 완료 (표시할 항목 없음)</b>", parse_mode='HTML')
+        cfg.log_event("SCHEDULE", "SYNC", "SUCCESS", "자동 동기화 (변경사항 없음)")
+        await status_msg.edit_text(f"📝 <b>[{time_str}] 장부 동기화 완료 (표시할 항목 없음)</b>", parse_mode='HTML')
     
     update_task_status(mode, "sync", "done")
 
@@ -1431,25 +1671,61 @@ async def scheduled_analytics_snapshot(context):
         async with tx_lock:
             cash, holdings = await asyncio.to_thread(broker.get_account_balance)
         if holdings is None: return
+        
         holdings_value = 0.0
+        ticker_state = {}
         for t in cfg.get_active_tickers():
             h = holdings.get(t, {'qty': 0, 'avg': 0})
-            if h['qty'] > 0:
-                curr_p = await asyncio.to_thread(broker.get_current_price, t)
-                holdings_value += (h['qty'] * curr_p)
+            avg, qty = float(h['avg']), int(h['qty'])
+            
+            curr_p = await asyncio.to_thread(broker.get_current_price, t)
+            # 🛑 [보정] 가격 조회 실패(0) 시 평단가로 대체하여 데이터 오염 방지
+            if curr_p <= 0: curr_p = avg
+            
+            # 🚀 [V24.1] 전략용 보조 지표 항구적 저장 (MA5, Day Low)
+            ma_5day = 0
+            day_low = curr_p
+            try:
+                # OHLCV 조회를 통해 지표 산정
+                ohlcv = await asyncio.to_thread(broker.get_daily_ohlcv, t, count=5)
+                if ohlcv and len(ohlcv) >= 5:
+                    ma_5day = sum(float(x['close']) for x in ohlcv) / 5
+                    day_low = min(float(x['low']) for x in ohlcv)
+            except: pass
+
+            if qty > 0:
+                holdings_value += (qty * curr_p)
+                
+            # 🛡️ [V24.5] 가격 방어: API가 0이면 메모리(live_data)에서 가져옴
+            if curr_p <= 0:
+                curr_p = float(live_data.get("tickers", {}).get(t, {}).get("current_price", 0))
+            if curr_p <= 0: # 최후의 수단으로 평단가
+                curr_p = avg
+
+            ticker_state[t] = {
+                "qty": qty,
+                "avg_price": avg,
+                "current_price": curr_p,
+                "prev_close": curr_p, 
+                "ma_5day": ma_5day,
+                "day_low": day_low,
+                "slots": live_data.get("tickers", {}).get(t, {}).get("slots", {}) # 📋 주문 계획 박제 보존
+            }
+            
         update_task_status(app_data['mode'], "after", "running")
-        snap = cfg.record_daily_snapshot(cash, holdings_value)
+        # 구체적인 ticker_state를 넘겨서 임시 장부(daily_snapshots.json)의 정확도를 높임
+        snap = cfg.record_daily_snapshot(cash, holdings_value, ticker_state=ticker_state)
         
         msg = (
-            f"📊 <b>[Daily Analytics Snapshot]</b>\n"
+            f"📊 <b>[Daily Analytics Snapshot] ({app_data['mode']})</b>\n"
             f"📅 날짜: {snap['date']}\n"
             f"💵 현금: ${snap['cash']:,.2f}\n"
             f"📈 주식: ${snap['holdings']:,.2f}\n"
             f"💰 총자산: ${snap['total']:,.2f}\n"
-            f"✅ 성과 분석 데이터가 기록되었습니다."
+            f"✅ 성과 분석 및 임시 장부 기록이 완료되었습니다."
         )
         await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='HTML')
-        cfg.record_event("SNAPSHOT", "SUCCESS", f"일일 분석 스냅샷 저장 완료 (${snap['total']:,.0f})")
+        cfg.log_event("SNAPSHOT", "SNAPSHOT", "SUCCESS", f"일일 분석 스냅샷 저장 완료 (${snap['total']:,.0f})")
         update_task_status(app_data['mode'], "after", "done")
         logging.info(f"📊 [Analytics] Daily snapshot recorded: ${snap['total']:,.2f}")
         
@@ -1472,24 +1748,23 @@ async def main():
         "token": os.getenv("MOCK_TELEGRAM_TOKEN"), "admin": os.getenv("MOCK_ADMIN_CHAT_ID") or os.getenv("ADMIN_CHAT_ID")
     }
 
-    target_hour, season_msg = get_target_hour()
+    target_hour, season_msg, _ = get_target_hour()
     print("=" * 50)
     print(f"🚀 Infinity Quant Hub V23.1 (Dual-Core Architecture)")
     print(f"📅 날짜 정보: {season_msg}")
     print("=" * 50)
 
-    # 🌅 [Unified Hub] 통합 웹 서버 독립 프로세스로 가동 (Port 5050)
+    # 🌅 [V27-Unified] 통합 웹 서버를 사이드 쓰레드로 가동 (Shared Memory & Logging)
+    def run_uvicorn():
+        print(f"🚀 [HUB] Web Dashboard Server (Port 5050) starting in background thread...")
+        uvicorn.run(web_app, host="0.0.0.0", port=5050, log_level="warning")
+
     try:
-        import sys
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        web_server_path = os.path.join(current_dir, "web_server.py")
-        
-        # [V23.6] 모든 웹 서버 로그는 자동으로 bot.log에 기록됩니다.
-        subprocess.Popen([sys.executable, "-u", web_server_path], 
-                         cwd=current_dir)
-        print("🚀 [HUB] Web Dashboard Server (Port 5050) started successfully.")
+        server_thread = threading.Thread(target=run_uvicorn, daemon=True)
+        server_thread.start()
+        print(f"✅ [HUB] Web Server thread started successfully.")
     except Exception as e:
-        print(f"❌ [HUB] Error starting Web Server: {e}")
+        print(f"❌ [HUB] Error starting Web Server thread: {e}")
 
     engines = []
     
@@ -1507,11 +1782,11 @@ async def main():
         print("❌ [치명적 오류] 가동 가능한 엔진이 없습니다. .env 파일을 확인하세요.")
         return
 
-    # 3. 병렬 엔진 가동
+    # 4. 병렬 엔진 가동 (무한 루프)
     print(f"✨ 총 {len(engines)}개의 엔진이 병렬로 가동됩니다.")
     await asyncio.gather(*(eng.start() for eng in engines))
     
-    # 무한 대기
+    # 상시 대기 루프 (엔진은 백그라운드 job_queue에서 동작함)
     while True:
         await asyncio.sleep(3600)
 

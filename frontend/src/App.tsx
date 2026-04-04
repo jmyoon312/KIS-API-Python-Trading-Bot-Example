@@ -5,6 +5,7 @@ import PerformanceAnalytics from './components/PerformanceAnalytics'
 import LedgerExplorer from './components/LedgerExplorer'
 import SimulationTestbed from './components/SimulationTestbed'
 import Login from './components/Login'
+import { Toaster } from 'react-hot-toast'
 
 type TabKey = 'terminal' | 'system' | 'ledger' | 'archive' | 'simulator'
 
@@ -119,6 +120,13 @@ function App() {
         {activeTab === 'archive' && <PerformanceAnalytics mode={activeMode} />}
         {activeTab === 'simulator' && <SimulationTestbed />}
       </main>
+
+      <Toaster 
+        position="top-right" 
+        toastOptions={{ 
+          style: { background: '#18181b', color: '#fff', border: '1px solid #27272a', fontSize: '12px', fontWeight: 'bold' } 
+        }} 
+      />
     </div>
   )
 }

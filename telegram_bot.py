@@ -27,6 +27,22 @@ class TelegramController:
         self.sync_locks = {} 
         self.tx_lock = tx_lock or asyncio.Lock()
         self.live_vitals = {} 
+        self.bot = None # 외부에서 주입받을 봇 객체
+
+    def set_bot(self, bot):
+        self.bot = bot
+
+    async def send_message(self, chat_id, text, parse_mode='HTML'):
+        """
+        🚀 [Universal] 외부 엔진에서 텔레그램 메시지를 보낼 때 사용하는 프록시 메서드
+        """
+        if self.bot:
+            try:
+                await self.bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode)
+            except Exception as e:
+                logging.error(f"❌ [Telegram] 메시지 전송 실패: {e}")
+        else:
+            logging.warning("⚠️ [Telegram] 봇 객체가 설정되지 않아 메시지를 보내지 못했습니다.")
 
     def _is_admin(self, update: Update):
         if self.admin_id is None:
@@ -333,7 +349,7 @@ class TelegramController:
                         # 🌟 [V22 패치] 비동기 독립 리밸런싱 실행
                         # 1. 현재 계좌의 총자산(주식잔고 + 현금잔고) 산출
                         try:
-                            _, fresh_holdings = self.broker.get_account_balance()
+                            cash, fresh_holdings = self.broker.get_account_balance()
                             t_price = await asyncio.to_thread(self.broker.get_current_price, "TQQQ", is_market_closed=True)
                             s_price = await asyncio.to_thread(self.broker.get_current_price, "SOXL", is_market_closed=True)
                             

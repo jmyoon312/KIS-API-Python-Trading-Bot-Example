@@ -7,11 +7,25 @@ const AVAILABLE_TICKERS = ['SOXL', 'TQQQ', 'UPRO', 'TECL', 'QLD', 'SPXL', 'FAS',
 export default function SystemControl({ mode }: { mode: 'mock' | 'real' }) {
   const [config, setConfig] = useState<any>(null)
   const [account, setAccount] = useState<any>(null)
-  const [turbo, setTurbo] = useState(false)
+  const [engineVersion, setEngineVersion] = useState('V24')
   const [engineOn, setEngineOn] = useState(false)
+  const [tactics, setTactics] = useState<any>({
+    shield: false,
+    shadow: false,
+    turbo: false,
+    sniper: true,
+    jupjup: false
+  })
+  
+  // 🔍 [V33 Search]
+  const [startDate, setStartDate] = useState('')
+  const [endDate, setEndDate] = useState('')
+  const [searchKeyword, setSearchKeyword] = useState('')
+  const [categoryFilter, setCategoryFilter] = useState('ALL')
+  
   const [activeTickers, setActiveTickers] = useState<string[]>([])
   const [rebalancing, setRebalancing] = useState(false)
-  const [forceRebalance, setForceRebalance] = useState(false) // 🔥 [V23.1] 즉시 강제 적용 여부
+  const [forceRebalance, setForceRebalance] = useState(false)
   const [showGuide, setShowGuide] = useState(false)
   const [statusMsg, setStatusMsg] = useState('')
   const [localRatios, setLocalRatios] = useState<Record<string, number>>({})
@@ -30,22 +44,30 @@ export default function SystemControl({ mode }: { mode: 'mock' | 'real' }) {
       setConfig(cfg)
       const cfgTickers = cfg.ACTIVE_TICKERS || ['SOXL', 'TQQQ']
       setActiveTickers(cfgTickers)
-      setTurbo(cfg.TURBO_MODE === true)
+      
+      // 상태 동기화
+      setEngineVersion(cfg.ENGINE_VERSION || 'V24')
       setEngineOn(cfg.ENGINE_STATUS === true)
+      
       if (resLedger.data.account) {
         setAccount(resLedger.data.account)
-        // 🌐 [V24] 로컬 비중 초기화 (State Sync 버그 수정)
         const ratios: Record<string, number> = {}
         cfgTickers.forEach((t: string) => {
-          ratios[t] = resLedger.data.account.tickers?.[t]?.ratio || (1 / cfgTickers.length)
+          // 🚀 [V24 패치] 실시간 장부(Ledger)가 아닌 설정값(Config)의 portfolio_ratio를 우선 참조
+          ratios[t] = cfg?.[t]?.portfolio_ratio || (1 / cfgTickers.length)
         })
         setLocalRatios(ratios)
       }
       
-      // 📋 [V24] 최근 운영 이벤트 로그 가져오기
       const resAnalytics = await api.get(`/analytics?mode=${mode}`)
       if (resAnalytics.data.events) {
         setEvents(resAnalytics.data.events)
+      }
+
+      // 🏹 [V25] 글로벌 전술 설정 로드
+      const resTactics = await api.get(`/settings/tactics?mode=${mode}`)
+      if (resTactics.data.tactics) {
+        setTactics(resTactics.data.tactics)
       }
     } catch (e) { console.error(e) }
   }
@@ -63,13 +85,18 @@ export default function SystemControl({ mode }: { mode: 'mock' | 'real' }) {
     setTimeout(() => setStatusMsg(''), 3000)
   }
 
-  const toggleTurbo = async () => {
-    const next = !turbo
-    setTurbo(next)
+  const handleStrategyChange = async (key: string, value: any, label: string) => {
     try {
-      await api.post('/settings/mode', { mode, value: next })
-      setStatusMsg(next ? '🏎️ 가속 모드 활성화' : '⏸️ 가속 모드 비활성화')
-    } catch { setStatusMsg('❌ 모드 변경 실패') }
+      if (key === 'version') setEngineVersion(value)
+
+      await api.post('/settings/global-strategy', { mode, key, value })
+      setStatusMsg(`✅ ${label} 변경 완료`)
+      
+      // [V25] 전술 상태 동기 유지
+      setTactics((prev: any) => ({ ...prev, [key]: value }))
+      
+      fetchData()
+    } catch { setStatusMsg(`❌ ${label} 변경 실패`) }
     setTimeout(() => setStatusMsg(''), 3000)
   }
 
@@ -94,7 +121,6 @@ export default function SystemControl({ mode }: { mode: 'mock' | 'real' }) {
   }
 
   const handleRebalance = async () => {
-    // 안전 경고: 보유 주식이 있는 종목이 있는지 확인
     let hasHoldings = false
     if (account?.tickers) {
       for (const t of activeTickers) {
@@ -117,11 +143,9 @@ export default function SystemControl({ mode }: { mode: 'mock' | 'real' }) {
     setRebalancing(true)
     setStatusMsg('⏳ 리밸런싱 처리 중...')
     try {
-      // 서버가 live_status.json에서 직접 총 자산을 읽어서 리밸런싱함
       const res = await api.post('/settings/seed', { mode, action: 'rebalance', force: forceRebalance })
       if (res.data.status === 'ok') {
         setStatusMsg(`✅ ${res.data.message}`)
-        // 설정 데이터 리프레시하여 새 시드 반영
         await fetchData()
       } else {
         setStatusMsg(`❌ ${res.data.message || '리밸런싱 실패'}`)
@@ -133,13 +157,10 @@ export default function SystemControl({ mode }: { mode: 'mock' | 'real' }) {
     setTimeout(() => setStatusMsg(''), 5000)
   }
 
-  // 🌐 [V24] 비중 조절 엔진 (합계 100% 제한 및 실시간 배분액 계산용)
   const updateRatio = (ticker: string, delta: number) => {
     setLocalRatios(prev => {
       const current = prev[ticker] || 0
       let next = Math.max(0, Math.min(1, current + delta))
-      
-      // 전체 합계가 100%를 초과하지 않도록 보정
       const otherSum = Object.entries(prev)
         .filter(([t]) => t !== ticker)
         .reduce((sum, [_, r]) => sum + r, 0)
@@ -147,12 +168,8 @@ export default function SystemControl({ mode }: { mode: 'mock' | 'real' }) {
       if (otherSum + next > 1.001) {
         next = Math.max(0, 1 - otherSum)
       }
-
       const updated = { ...prev, [ticker]: next }
-      
-      // 백엔드 즉시 저장 (Debounced or Async)
       api.post('/settings/portfolio-ratios', { mode, ratios: { [ticker]: next } })
-      
       return updated
     })
   }
@@ -170,55 +187,30 @@ export default function SystemControl({ mode }: { mode: 'mock' | 'real' }) {
     }
   }
 
-  // 👤 [V24] Shadow-Strike 설정 업데이트 핸들러
-  const handleShadowToggle = async (ticker: string, currentActive: boolean, bounce: number) => {
-    try {
-      await api.post('/settings/shadow', { mode, ticker, active: !currentActive, bounce })
-      await fetchData() // UI 갱신
-    } catch { setStatusMsg(`❌ [${ticker}] Shadow 모드 변경 실패`) }
-  }
-
-  const handleShadowBounce = async (ticker: string, active: boolean, newBounce: number) => {
-    try {
-      await api.post('/settings/shadow', { mode, ticker, active, bounce: newBounce })
-      // 성능을 위해 local config만 업데이트 (debounce 처리가 좋으나 여기선 단순화)
-      setConfig((prev: any) => ({
-        ...prev,
-        [ticker]: { ...prev[ticker], shadow: { active, bounce: newBounce } }
-      }))
-    } catch { setStatusMsg(`❌ [${ticker}] Bounce 비율 변경 실패`) }
-  }
-
-  // 🌐 [V24] 총 자산 실시간 보정 계산 (현금 + ∑(종목별 수량 * 현재가))
   const calculatedHoldingsVal = account?.tickers ? Object.values(account.tickers).reduce((sum: number, t: any) => {
     return sum + (Number(t.qty || 0) * Number(t.current_price || 0))
   }, 0) : 0
   const totalAsset = account ? (account.cash || 0) + (calculatedHoldingsVal || account.holdings_value || 0) : 0
 
-  // Per-ticker seed info (from ConfigManager aggregated config)
   const tickerSeeds = activeTickers.map((t: string) => ({
     ticker: t,
     seed: config?.[t]?.seed || 0,
-    version: config?.[t]?.version || 'V22',
     ratio: config?.[t]?.portfolio_ratio || 0,
     holdingQty: account?.tickers?.[t]?.qty || 0,
-    shadow: config?.[t]?.shadow || { active: false, bounce: 1.5 }
   }))
 
   const totalSeed = tickerSeeds.reduce((s: number, ts: any) => s + ts.seed, 0)
 
   return (
     <div className="space-y-4 animate-fade-in-up pb-12">
-
-      {/* Status message toast */}
       {statusMsg && (
-        <div className="bg-[#18181b] border border-[#3f3f46] rounded-xl px-4 py-2.5 text-sm font-medium text-white animate-fade-in shadow-lg">
+        <div className="fixed top-20 left-1/2 -translate-x-1/2 z-50 bg-[#18181b] border border-[#3f3f46] rounded-xl px-4 py-2.5 text-sm font-medium text-white animate-fade-in shadow-lg">
           {statusMsg}
         </div>
       )}
 
-      {/* Section 0: Engine Power (NEW [V23.1]) */}
-      <div className="bg-[#121214] rounded-2xl border border-[#27272a] p-5 shadow-lg overflow-hidden relative">
+      {/* Section 0: 엔진 가동 (Engine Power) */}
+      <div className="bg-[#121214] rounded-2xl border border-[#27272a] p-5 shadow-lg relative overflow-hidden">
         <div className="flex justify-between items-start relative z-10">
           <div>
             <h3 className="text-white font-bold text-sm flex items-center gap-2">
@@ -241,60 +233,155 @@ export default function SystemControl({ mode }: { mode: 'mock' | 'real' }) {
             {engineOn ? '⏹️ 정지' : '▶️ 가동'}
           </button>
         </div>
-        <p className="text-gray-500 text-[0.65rem] mt-3 bg-[#18181b] p-2 rounded-lg border border-[#27272a]">
-          ※ <b>전원 제어</b>: 해당 엔진의 모든 자동매매 스케줄을 즉시 중단하거나 재개합니다. 
-        </p>
       </div>
 
-      {/* Section 1: Turbo Mode */}
-      <div className="bg-[#121214] rounded-2xl border border-[#27272a] p-5 shadow-lg">
-        <div className="flex justify-between items-center">
-          <div>
-            <h3 className="text-white font-bold text-sm flex items-center gap-2">
-              🚀 부스터 가속 모드 <span className="text-[0.55rem] text-gray-500 font-normal tracking-wider uppercase">(Turbo)</span>
-            </h3>
-            <p className="text-gray-500 text-xs mt-1">LOC 매수 외에 추가 가속 매수를 동시 주문합니다.</p>
-          </div>
-          <button 
-            onClick={toggleTurbo}
-            className={`relative w-14 h-7 rounded-full transition-all duration-300 shadow-inner flex-shrink-0 ${turbo ? 'bg-red-600 shadow-[0_0_12px_rgba(239,68,68,0.5)]' : 'bg-[#27272a]'}`}
-          >
-            <div className={`w-5 h-5 rounded-full bg-white absolute top-1 transition-transform duration-300 shadow-md ${turbo ? 'translate-x-8' : 'translate-x-1'}`}></div>
-          </button>
+      {/* ⚙️ 무한매수법 베이스 전략 선택 (Base Strategy Selection) */}
+      <div className="bg-[#121214] rounded-2xl border border-[#27272a] p-5 shadow-lg space-y-4">
+        <h4 className="text-white font-bold text-xs uppercase tracking-widest mb-4 flex items-center gap-2">
+          ⚙️ 무한매수법 베이스 전략 <span className="text-[0.6rem] text-blue-500 font-normal tracking-wider lowercase">(Laoer Methodology)</span>
+        </h4>
+        
+        <div className="grid grid-cols-1 gap-3">
+          {[
+            { id: 'V13', name: 'V13 [V1 원본 정석]', sub: '40분할 / 평단·별값 분할 매수', desc: '라오어 원작 방법론의 가장 기본이 되는 정석 분할 매수 전략' },
+            { id: 'V14', name: 'V14 [V2.1 가변 방어]', sub: '평단 집중 매체 및 전술 최적화', desc: '평단가(Avg)에서 1.0 분량을 집중 매수하여 방어력을 높이고, 별도 전술로 수익을 극대화' },
+            { id: 'V24', name: 'V24 [V4 제로 리버스]', sub: 'T-Value 정밀 운용 및 쿼터 익절', desc: '1/4 쿼터 익절로 현금을 확보하고, 원금 소진 시 리버스(제로) 모드로 자동 전환' }
+          ].map(s => (
+            <button
+              key={s.id}
+              onClick={() => handleStrategyChange('version', s.id, '베이스 전략')}
+              className={`p-4 rounded-2xl border text-left transition-all relative overflow-hidden group ${
+                engineVersion === s.id 
+                  ? 'bg-blue-600/10 border-blue-500 shadow-[0_0_20px_rgba(59,130,246,0.15)]' 
+                  : 'bg-[#18181b] border-[#27272a] hover:border-gray-600'
+              }`}
+            >
+              {engineVersion === s.id && (
+                <div className="absolute top-0 right-0 p-2">
+                  <span className="flex h-2 w-2">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75"></span>
+                    <span className="relative inline-flex rounded-full h-2 w-2 bg-blue-500"></span>
+                  </span>
+                </div>
+              )}
+              <div className="flex justify-between items-center mb-1">
+                <span className={`text-sm font-black ${engineVersion === s.id ? 'text-blue-400' : 'text-white'}`}>{s.name}</span>
+              </div>
+              <div className="text-gray-300 text-[0.65rem] font-bold mb-1 opacity-80">{s.sub}</div>
+              <p className="text-gray-500 text-[0.6rem] leading-relaxed group-hover:text-gray-400 transition-colors">{s.desc}</p>
+            </button>
+          ))}
         </div>
-        {turbo && (
-          <div className="mt-3 bg-red-900/20 border border-red-800/40 rounded-lg px-3 py-2 text-red-400 text-xs font-medium">
-            ⚡ 가속 활성 — 평단 -5% 선제 저가 매수가 추가로 주문됩니다
-          </div>
-        )}
       </div>
 
-      {/* Section 2: Rebalance - SMART [V24] */}
+      {/* 🛡️ 전술 명령 센터 (Tactical Command Center) - NEW V25 */}
+      <div className="bg-[#121214] rounded-2xl border border-[#27272a] p-5 shadow-lg space-y-4">
+        <h3 className="text-white font-bold text-sm flex items-center gap-2">
+          🛡️ 전술 명령 센터 <span className="text-[0.55rem] text-blue-500 font-normal tracking-wider uppercase">(Tactical Command Center)</span>
+        </h3>
+        <p className="text-gray-500 text-[0.65rem] -mt-2">무한매수법 Base 전략 위에 덧씌워지는 상황별 전술들을 일괄 통제합니다.</p>
+        
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-4">
+          {/* [방어] 쉴드 (MDD 방어) */}
+          <div className={`p-4 rounded-xl border transition-all flex justify-between items-center ${tactics.shield ? 'bg-blue-900/10 border-blue-500/40 shadow-[0_0_15px_rgba(59,130,246,0.1)]' : 'bg-[#18181b] border-[#27272a]'}`}>
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-bold text-white">[방어] 쉴드 (MDD 방어)</span>
+                {tactics.shield && <span className="animate-pulse w-1.5 h-1.5 rounded-full bg-blue-500 shadow-[0_0_8px_rgba(59,130,246,0.8)]"></span>}
+              </div>
+              <p className="text-[0.6rem] text-gray-500 mt-0.5">T-Value 기반 가변 분할 확장</p>
+            </div>
+            <button onClick={() => handleStrategyChange('shield', !tactics.shield, '쉴드 (MDD 방어)')} className={`w-10 h-5 rounded-full relative transition-colors ${tactics.shield ? 'bg-blue-600' : 'bg-[#27272a]'}`}>
+              <div className={`w-3 h-3 rounded-full bg-white absolute top-1 transition-transform ${tactics.shield ? 'translate-x-6' : 'translate-x-1'}`}></div>
+            </button>
+          </div>
+
+          {/* [진입] 새도우 스트라이크 */}
+          <div className={`p-4 rounded-xl border transition-all flex justify-between items-center ${tactics.shadow ? 'bg-purple-900/10 border-purple-500/40 shadow-[0_0_15px_rgba(168,85,247,0.1)]' : 'bg-[#18181b] border-[#27272a]'}`}>
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-bold text-white">[진입] 새도우 스트라이크</span>
+                {tactics.shadow && <span className="animate-pulse w-1.5 h-1.5 rounded-full bg-purple-500 shadow-[0_0_8px_rgba(168,85,247,0.8)]"></span>}
+              </div>
+              <p className="text-[0.6rem] text-gray-500 mt-0.5">최저가 대비 반등 포착 실시간 매수</p>
+            </div>
+            <button onClick={() => handleStrategyChange('shadow', !tactics.shadow, '새도우 스트라이크')} className={`w-10 h-5 rounded-full relative transition-colors ${tactics.shadow ? 'bg-purple-600' : 'bg-[#27272a]'}`}>
+              <div className={`w-3 h-3 rounded-full bg-white absolute top-1 transition-transform ${tactics.shadow ? 'translate-x-6' : 'translate-x-1'}`}></div>
+            </button>
+          </div>
+
+          {/* [가속] 터보 부스터 */}
+          <div className={`p-4 rounded-xl border transition-all flex justify-between items-center ${tactics.turbo ? 'bg-red-900/10 border-red-500/40 shadow-[0_0_15px_rgba(239,68,68,0.1)]' : 'bg-[#18181b] border-[#27272a]'}`}>
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-bold text-white">[가속] 터보 부스터</span>
+                {tactics.turbo && <span className="animate-pulse w-1.5 h-1.5 rounded-full bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.8)]"></span>}
+              </div>
+              <p className="text-[0.6rem] text-gray-500 mt-0.5">급락장 평단가 하강 가속화</p>
+            </div>
+            <button onClick={() => handleStrategyChange('turbo', !tactics.turbo, '터보 부스터')} className={`w-10 h-5 rounded-full relative transition-colors ${tactics.turbo ? 'bg-red-600' : 'bg-[#27272a]'}`}>
+              <div className={`w-3 h-3 rounded-full bg-white absolute top-1 transition-transform ${tactics.turbo ? 'translate-x-6' : 'translate-x-1'}`}></div>
+            </button>
+          </div>
+
+          {/* [탈출] 스나이퍼 익절 */}
+          <div className={`p-4 rounded-xl border transition-all flex justify-between items-center ${tactics.sniper ? 'bg-green-900/10 border-green-500/40 shadow-[0_0_15px_rgba(34,197,94,0.15)]' : 'bg-[#18181b] border-[#27272a]'}`}>
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-bold text-white">[탈출] 스나이퍼 익절</span>
+                {tactics.sniper && <span className="animate-pulse w-1.5 h-1.5 rounded-full bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.8)]"></span>}
+              </div>
+              <p className="text-[0.6rem] text-gray-500 mt-0.5">별지점 기반 1/4 선제 익절</p>
+            </div>
+            <button onClick={() => handleStrategyChange('sniper', !tactics.sniper, '스나이퍼 익절')} className={`w-10 h-5 rounded-full relative transition-colors ${tactics.sniper ? 'bg-green-600' : 'bg-[#27272a]'}`}>
+              <div className={`w-3 h-3 rounded-full bg-white absolute top-1 transition-transform ${tactics.sniper ? 'translate-x-6' : 'translate-x-1'}`}></div>
+            </button>
+          </div>
+
+          {/* [정밀] 줍줍 거미줄 */}
+          <div className={`p-4 rounded-xl border transition-all flex justify-between items-center ${tactics.jupjup ? 'bg-yellow-900/10 border-yellow-500/40 shadow-[0_0_15px_rgba(234,179,8,0.1)]' : 'bg-[#18181b] border-[#27272a]'}`}>
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-bold text-white">[정밀] 줍줍 거미줄</span>
+                {tactics.jupjup && <span className="animate-pulse w-1.5 h-1.5 rounded-full bg-yellow-500 shadow-[0_0_8px_rgba(234,179,8,0.8)]"></span>}
+              </div>
+              <p className="text-[0.6rem] text-gray-500 mt-0.5">자투리 현금 기반 촘촘한 추가 매수</p>
+            </div>
+            <button onClick={() => handleStrategyChange('jupjup', !tactics.jupjup, '줍줍 거미줄')} className={`w-10 h-5 rounded-full relative transition-colors ${tactics.jupjup ? 'bg-yellow-600' : 'bg-[#27272a]'}`}>
+              <div className={`w-3 h-3 rounded-full bg-white absolute top-1 transition-transform ${tactics.jupjup ? 'translate-x-6' : 'translate-x-1'}`}></div>
+            </button>
+          </div>
+        </div>
+
+
+      </div>
+
+      {/* Section 2: 시드 재분배 (Smart Rebalance) */}
       <div className="bg-[#121214] rounded-2xl border border-[#27272a] p-5 shadow-lg">
         <h3 className="text-white font-bold text-sm flex items-center gap-2 mb-3">
-          ⚖️ 스마트 시드 재분배 <span className="text-[0.55rem] text-gray-500 font-normal tracking-wider uppercase">(Smart Rebalance)</span>
+          ⚖️ 시드 재분배 <span className="text-[0.55rem] text-gray-500 font-normal tracking-wider uppercase">(Seed Rebalance)</span>
         </h3>
-        <p className="text-gray-500 text-xs mb-3">전체 평가 자산을 기준으로 각 종목별 타겟 비중에 맞춰 시드를 재계산합니다.</p>
         
         <div className="bg-[#18181b] rounded-xl border border-[#27272a] p-4 mb-4">
           <div className="flex justify-between items-center mb-1 pb-2 border-b border-[#27272a]/50">
-            <span className="text-gray-400 text-[0.6rem] font-bold uppercase tracking-widest">💰 자산 구성 요약</span>
+            <span className="text-gray-400 text-[0.6rem] font-bold uppercase tracking-widest">💰 계좌 총자산</span>
             <span className="text-white font-black text-sm tabular-nums">${totalAsset.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
           </div>
+          
           <div className="flex justify-between text-[0.6rem] py-1 text-gray-500">
             <span>현금(Cash)</span>
             <span className="text-gray-400">${(account?.cash || 0).toLocaleString()}</span>
           </div>
           <div className="flex justify-between text-[0.6rem] py-1 text-gray-500">
             <span>주식(Holdings)</span>
-            <span className="text-gray-400">${(account?.holdings_value || 0).toLocaleString()}</span>
+            <span className="text-gray-400">${(calculatedHoldingsVal || 0).toLocaleString(undefined, { minimumFractionDigits: 1, maximumFractionDigits: 1 })}</span>
           </div>
-          <div className="flex justify-between text-[0.6rem] py-1 text-yellow-600/70 font-bold border-t border-[#27272a] mt-1 pt-1">
-            <span>총 시드 합계</span>
+          <div className="flex justify-between text-[0.6rem] py-1 text-yellow-600/70 font-bold border-t border-[#27272a] mt-1 pt-1 pb-2">
+            <span>보유 시드 합계</span>
             <span>${totalSeed.toLocaleString()}</span>
           </div>
-
-          <div className="text-[0.65rem] font-bold text-gray-400 mb-3 mt-4 border-t border-[#27272a] pt-3 flex justify-between">
+          
+          <div className="text-[0.65rem] font-bold text-gray-400 mb-3 mt-2 border-t border-[#27272a]/30 pt-3 flex justify-between">
             <span>📊 종목별 타겟 비중 (%)</span>
             <span className={`px-1.5 py-0.5 rounded ${Math.abs(tickerSeeds.reduce((a, b) => a + (b.ratio || 0), 0) - 1) < 0.001 ? 'bg-green-500/10 text-green-500' : 'bg-red-500/10 text-red-500'} font-black`}>
                합계: {(tickerSeeds.reduce((a, b) => a + (b.ratio || 0), 0) * 100).toFixed(0)}%
@@ -303,45 +390,18 @@ export default function SystemControl({ mode }: { mode: 'mock' | 'real' }) {
           
           <div className="space-y-3">
             {tickerSeeds.map(ts => (
-              <div key={ts.ticker} className="space-y-1 bg-[#121214] p-3 rounded-xl border border-[#27272a]/40">
+              <div key={ts.ticker} className="space-y-1">
                 <div className="flex justify-between items-center text-xs">
-                  <div className="flex flex-col">
-                    <span className="text-gray-100 font-bold flex items-center gap-1">
-                      {ts.ticker}
-                      {ts.holdingQty > 0 && <span className="text-[0.6rem] bg-yellow-500/10 text-yellow-500 px-1 rounded border border-yellow-500/20">{ts.holdingQty}주</span>}
-                    </span>
-                    {/* 👤 [V24] Shadow-Strike 제어 유닛 */}
-                    <div className="flex items-center gap-2 mt-1">
-                      <button 
-                        onClick={() => handleShadowToggle(ts.ticker, ts.shadow.active, ts.shadow.bounce)}
-                        className={`text-[0.55rem] px-1.5 py-0.5 rounded transition-all font-bold ${ts.shadow.active ? 'bg-indigo-600 text-white' : 'bg-gray-800 text-gray-500'}`}
-                      >
-                        👤 SHADOW {ts.shadow.active ? 'ON' : 'OFF'}
-                      </button>
-                      {ts.shadow.active && (
-                        <div className="flex items-center gap-1">
-                          <input 
-                            type="range" min="0.5" max="5.0" step="0.1" 
-                            value={ts.shadow.bounce} 
-                            onChange={(e) => handleShadowBounce(ts.ticker, ts.shadow.active, parseFloat(e.target.value))}
-                            className="w-12 h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-indigo-500"
-                          />
-                          <span className="text-[0.55rem] text-indigo-400 font-mono">{ts.shadow.bounce}%</span>
-                        </div>
-                      )}
-                    </div>
-                  </div>
+                  <span className="text-gray-100 font-bold flex items-center gap-1">
+                    {ts.ticker}
+                    {ts.holdingQty > 0 && <span className="text-[0.6rem] bg-yellow-500/10 text-yellow-500 px-1 rounded border border-yellow-500/20">{ts.holdingQty}주</span>}
+                  </span>
                   <div className="flex items-center gap-2">
                     <span className="text-yellow-500 font-bold tabular-nums text-[0.65rem]">
                       ${Math.round(totalAsset * (localRatios[ts.ticker] || 0)).toLocaleString()}
                     </span>
                     <div className="flex items-center bg-[#09090b] rounded-lg border border-[#3f3f46] p-0.5 overflow-hidden">
-                      <button 
-                        onMouseDown={() => startAdjusting(ts.ticker, -0.01)}
-                        onMouseUp={stopAdjusting}
-                        onMouseLeave={stopAdjusting}
-                        className="w-5 h-5 flex items-center justify-center text-gray-500 hover:text-white hover:bg-[#27272a] transition-colors rounded"
-                      >
+                      <button onMouseDown={() => startAdjusting(ts.ticker, -0.01)} onMouseUp={stopAdjusting} onMouseLeave={stopAdjusting} className="w-5 h-5 flex items-center justify-center text-gray-500 hover:text-white hover:bg-[#27272a] transition-colors rounded">
                         <span className="text-sm">−</span>
                       </button>
                       <input 
@@ -353,12 +413,7 @@ export default function SystemControl({ mode }: { mode: 'mock' | 'real' }) {
                         }}
                         className="w-7 bg-transparent text-center text-xs focus:outline-none focus:text-blue-400 font-bold [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
                       />
-                      <button 
-                        onMouseDown={() => startAdjusting(ts.ticker, 0.01)}
-                        onMouseUp={stopAdjusting}
-                        onMouseLeave={stopAdjusting}
-                        className="w-5 h-5 flex items-center justify-center text-gray-500 hover:text-white hover:bg-[#27272a] transition-colors rounded"
-                      >
+                      <button onMouseDown={() => startAdjusting(ts.ticker, 0.01)} onMouseUp={stopAdjusting} onMouseLeave={stopAdjusting} className="w-5 h-5 flex items-center justify-center text-gray-500 hover:text-white hover:bg-[#27272a] transition-colors rounded">
                         <span className="text-sm">+</span>
                       </button>
                     </div>
@@ -375,37 +430,24 @@ export default function SystemControl({ mode }: { mode: 'mock' | 'real' }) {
         <button 
           onClick={handleRebalance}
           disabled={rebalancing}
-          className="w-full py-3 rounded-xl font-bold text-sm transition-all border border-blue-500/50 bg-blue-900/20 text-blue-400 hover:bg-blue-800/30 hover:shadow-[0_0_20px_rgba(59,130,246,0.25)] active:scale-[0.98] disabled:opacity-40 flex justify-center items-center gap-2"
+          className="w-full py-3 rounded-xl font-bold text-sm transition-all border border-blue-500/50 bg-blue-900/20 text-blue-400 hover:bg-blue-800/30 active:scale-[0.98] disabled:opacity-40 flex justify-center items-center gap-2"
         >
           {rebalancing ? '⏳ 재분배 중...' : '⚖️ 설정된 비중으로 시드 일괄 재분배'}
         </button>
         
         <div className="mt-3 flex items-center gap-2 justify-center">
-          <input 
-            type="checkbox" 
-            id="forceRebalance" 
-            checked={forceRebalance} 
-            onChange={(e) => setForceRebalance(e.target.checked)}
-            className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500 bg-[#18181b]"
-          />
+          <input type="checkbox" id="forceRebalance" checked={forceRebalance} onChange={(e) => setForceRebalance(e.target.checked)} className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500 bg-[#18181b]" />
           <label htmlFor="forceRebalance" className="text-[0.65rem] text-gray-400 cursor-pointer hover:text-gray-200 transition-colors">
             ⚠️ <span className="underline decoration-dotted text-red-500/70">즉시 강제 적용</span> (활동 중인 매매에도 즉각 반영)
           </label>
         </div>
-
-        <p className="text-gray-600 text-[0.6rem] mt-2 text-center">
-          {forceRebalance 
-            ? "※ 주의: 현재 진행 중인 매매의 평단가 및 분할 매수 계산이 즉시 변경됩니다." 
-            : "※ 권장: 보유 수량이 0원(졸업)이 된 시점부터 새로운 시드가 순차 적용됩니다."}
-        </p>
       </div>
 
-      {/* Section 3: Active Tickers */}
+      {/* Section 3: 운용 종목 선택 (Tickers) */}
       <div className="bg-[#121214] rounded-2xl border border-[#27272a] p-5 shadow-lg">
         <h3 className="text-white font-bold text-sm flex items-center gap-2 mb-3">
-          🎯 운용 종목 선택 <span className="text-[0.55rem] text-gray-500 font-normal tracking-wider uppercase">(Tickers)</span>
+          🎯 운용 종목 선택 <span className="text-[0.55rem] text-gray-500 font-normal tracking-wider uppercase">(Active Tickers)</span>
         </h3>
-        <p className="text-gray-500 text-xs mb-3">엔진이 매일 자동 매매하는 대상 종목을 선택합니다.</p>
         <div className="grid grid-cols-2 gap-2">
           {AVAILABLE_TICKERS.map(t => {
             const isActive = activeTickers.includes(t)
@@ -426,40 +468,126 @@ export default function SystemControl({ mode }: { mode: 'mock' | 'real' }) {
         </div>
       </div>
       
-      {/* 📋 Section 3.1: Event Log Console (NEW [V24]) */}
+      {/* 📋 Section 3.1: 운영 아카이브 (Event Archive) */}
       <div className="bg-[#121214] rounded-2xl border border-[#27272a] p-5 shadow-lg">
-        <h3 className="text-white font-bold text-sm flex items-center gap-2 mb-3">
-          📋 시스템 운영 아카이브 <span className="text-[0.55rem] text-gray-500 font-normal tracking-wider uppercase">(Event Archive)</span>
-        </h3>
+        <div className="flex flex-wrap justify-between items-center gap-2 mb-3">
+          <h3 className="text-white font-bold text-sm flex items-center gap-2">
+            📋 운영 아카이브 <span className="text-[0.55rem] text-gray-500 font-normal tracking-wider uppercase">(Event Archive)</span>
+          </h3>
+          <button
+            onClick={async () => {
+              if (window.confirm("운영 아카이브 기록을 영구적으로 초기화하시겠습니까?")) {
+                try {
+                  await api.post('/events/clear', { mode });
+                  setSearchKeyword('');
+                  setStartDate('');
+                  setEndDate('');
+                  fetchData();
+                } catch (e) {
+                  console.error("초기화 실패:", e);
+                }
+              }
+            }}
+            className="text-[0.6rem] text-gray-500 hover:text-red-400 font-bold transition-colors bg-[#27272a] px-2 py-0.5 rounded-full whitespace-nowrap"
+          >
+            내역 비우기
+          </button>
+        </div>
+
+        {/* 🔍 [V33 Search Bar] */}
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-4 bg-[#09090b] p-3 rounded-xl border border-[#27272a]/50">
+          <div className="flex flex-col gap-1">
+            <span className="text-[0.5rem] text-gray-600 font-bold ml-1">상태/카테고리</span>
+            <select 
+              value={categoryFilter}
+              onChange={(e) => setCategoryFilter(e.target.value)}
+              className="bg-[#18181b] border border-[#27272a] rounded-lg text-[0.6rem] text-white p-1.5 outline-none focus:border-blue-500/50"
+            >
+              <option value="ALL">전체 보기</option>
+              <option value="TRADE">매매 기록 (TRADE)</option>
+              <option value="SCHEDULE">일정 기록 (SCHEDULE)</option>
+              <option value="SYSTEM">시스템 로그 (SYSTEM)</option>
+            </select>
+          </div>
+          <div className="flex flex-col gap-1">
+            <span className="text-[0.5rem] text-gray-600 font-bold ml-1">검색 키워드</span>
+            <input 
+              type="text" 
+              placeholder="내용 검색..." 
+              value={searchKeyword}
+              onChange={(e) => setSearchKeyword(e.target.value)}
+              className="bg-[#18181b] border border-[#27272a] rounded-lg text-[0.6rem] text-white p-1.5 outline-none focus:border-blue-500/50"
+            />
+          </div>
+          <div className="flex flex-col gap-1">
+            <span className="text-[0.5rem] text-gray-600 font-bold ml-1">기간 시작 (MM/DD)</span>
+            <input 
+              type="text" 
+              placeholder="04/01" 
+              value={startDate}
+              onChange={(e) => setStartDate(e.target.value)}
+              className="bg-[#18181b] border border-[#27272a] rounded-lg text-[0.6rem] text-white p-1.5 outline-none focus:border-blue-500/50"
+            />
+          </div>
+          <div className="flex flex-col gap-1">
+            <span className="text-[0.5rem] text-gray-600 font-bold ml-1">기간 종료 (MM/DD)</span>
+            <input 
+              type="text" 
+              placeholder="04/30" 
+              value={endDate}
+              onChange={(e) => setEndDate(e.target.value)}
+              className="bg-[#18181b] border border-[#27272a] rounded-lg text-[0.6rem] text-white p-1.5 outline-none focus:border-blue-500/50"
+            />
+          </div>
+        </div>
         <div className="bg-[#09090b] rounded-xl border border-[#27272a] p-0 overflow-hidden">
           <div className="max-h-[250px] overflow-y-auto scrollbar-thin scrollbar-thumb-[#3f3f46]">
             {events.length === 0 ? (
-              <div className="p-8 text-center text-gray-600 text-[0.65rem]">지정된 작업 기록이 아직 없습니다.</div>
+              <div className="p-8 text-center text-gray-600 text-[0.65rem]">기록이 없습니다.</div>
             ) : (
               <table className="w-full text-left text-[0.65rem] border-collapse">
                 <thead className="sticky top-0 bg-[#18181b] border-b border-[#27272a] z-10 text-gray-500 font-bold">
                   <tr>
-                    <th className="px-3 py-2 w-16">TIME</th>
-                    <th className="px-3 py-2 w-20">TASK</th>
+                    <th className="px-3 py-2 w-12">DATE</th>
+                    <th className="px-2 py-2 w-16">TIME</th>
+                    <th className="px-2 py-2 w-20">TASK</th>
                     <th className="px-3 py-2">SUMMARY</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-[#27272a]">
-                  {[...events].reverse().map((ev, idx) => (
+                  {[...events]
+                    .filter((ev: any) => {
+                      const k = searchKeyword.toLowerCase();
+                      const match_k = !k || (ev.msg?.toLowerCase().includes(k) || ev.task?.toLowerCase().includes(k));
+                      const match_c = categoryFilter === 'ALL' || ev.category === categoryFilter;
+                      const match_s = !startDate || ev.date >= startDate;
+                      const match_e = !endDate || ev.date <= endDate;
+                      return match_k && match_c && match_s && match_e;
+                    })
+                    .reverse().map((ev, idx) => (
                     <tr key={idx} className="hover:bg-[#18181b]/50 transition-colors">
-                      <td className="px-3 py-2.5 text-gray-500 font-mono tracking-tighter">{ev.time}</td>
-                      <td className="px-3 py-2.5">
-                        <span className={`px-1.5 py-0.5 rounded-md font-bold text-[0.55rem] ${
-                          ev.status === 'SUCCESS' ? 'text-green-500 bg-green-500/10' : 
-                          ev.status === 'ERROR' ? 'text-red-500 bg-red-500/10' : 
-                          'text-yellow-500 bg-yellow-500/10'
-                        }`}>
-                          {ev.task}
-                        </span>
+                      <td className="px-3 py-2.5 text-gray-600 font-mono tracking-tighter text-[0.6rem]">{ev.date || ''}</td>
+                      <td className="px-2 py-2.5 text-gray-500 font-mono tracking-tighter">{ev.time}</td>
+                      <td className="px-2 py-2.5">
+                        <div className="flex flex-col gap-1">
+                          <span className={`px-1.5 py-0.5 rounded-md font-bold text-[0.55rem] w-max ${
+                            ev.status === 'SUCCESS' ? 'text-green-500 bg-green-500/10' : 
+                            ev.status === 'ERROR' ? 'text-red-500 bg-red-500/10' : 
+                            ev.status === 'WARNING' ? 'text-yellow-500 bg-yellow-500/10' :
+                            'text-blue-500 bg-blue-500/10'
+                          }`}>
+                            {ev.task}
+                          </span>
+                          {ev.category && (
+                            <span className="text-[0.45rem] text-gray-600 font-black tracking-widest px-1 uppercase">
+                              {ev.category}
+                            </span>
+                          )}
+                        </div>
                       </td>
-                      <td className="px-3 py-2.5 text-gray-300 font-medium">
+                      <td className="px-3 py-2.5 text-gray-300 font-medium leading-relaxed">
                         {ev.msg}
-                        {ev.details && <div className="text-gray-500 mt-0.5 text-[0.6rem] leading-tight italic">{ev.details}</div>}
+                        {ev.details && <div className="text-gray-500 mt-1 text-[0.6rem] leading-tight italic font-light">{ev.details}</div>}
                       </td>
                     </tr>
                   ))}
@@ -468,20 +596,12 @@ export default function SystemControl({ mode }: { mode: 'mock' | 'real' }) {
             )}
           </div>
         </div>
-        <p className="text-gray-600 text-[0.55rem] mt-2 italic px-1">
-          ※ <b>운영 아카이브</b>: 자율 주행 엔진이 수행한 모든 스케줄과 제어 이력을 영구 보존하며, 실시간 상황실과 연동됩니다.
-        </p>
       </div>
 
-      {/* Section 4: Strategy Guide (collapsible) */}
+      {/* Section 4: 전략 가이드 */}
       <div className="bg-[#121214] rounded-2xl border border-[#27272a] shadow-lg overflow-hidden">
-        <button
-          onClick={() => setShowGuide(!showGuide)}
-          className="w-full p-5 flex justify-between items-center hover:bg-[#18181b] transition-colors"
-        >
-          <h3 className="text-white font-bold text-sm flex items-center gap-2">
-            📖 전략 백서 & 가이드
-          </h3>
+        <button onClick={() => setShowGuide(!showGuide)} className="w-full p-5 flex justify-between items-center hover:bg-[#18181b] transition-colors">
+          <h3 className="text-white font-bold text-sm flex items-center gap-2">📖 전략 백서 & 가이드</h3>
           <span className={`text-gray-400 text-xl transition-transform duration-300 ${showGuide ? 'rotate-180' : ''}`}>▼</span>
         </button>
         {showGuide && (
