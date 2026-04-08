@@ -40,4 +40,3 @@ dist/
 # Build & Deployment (Requested to Exclude)
 Dockerfile
 supervisord.conf
-requirements.txt

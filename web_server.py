@@ -169,11 +169,7 @@ def clear_logs_api(req: dict):
     """지정된 모드(mock/real)의 알림 내역을 영구히 초기화합니다."""
     mode = req.get("mode", "real")
     
-    if os.name == 'nt': ROOT_LOG_DIR = "logs"
-    else: ROOT_LOG_DIR = "logs"
-    
-    log_dir = os.path.join(ROOT_LOG_DIR, mode)
-    notif_path = os.path.join(log_dir, "notifications.json")
+    notif_path = os.path.join(DATA_DIR, mode, "notifications.json")
     if os.path.exists(notif_path):
         try:
             with open(notif_path, 'w', encoding='utf-8') as f:
@@ -384,18 +380,28 @@ def update_global_strategy(req: dict):
                     for t in live_data["tickers"]:
                         live_data["tickers"][t]["version"] = val
                         # 🚀 [V26.8] 슬롯 명칭도 즉시 동기화 (Instant UI Feedback)
+                        slots = live_data["tickers"][t].get("slots", {})
                         for sid in ["slot_1", "slot_2", "slot_3", "slot_4", "slot_5"]:
-                            if sid in live_data["tickers"][t].get("slots", {}):
-                                # "[1차] V13:평단매수" 형식에서 V13만 새 버전으로 교체
-                                old_desc = live_data["tickers"][t]["slots"][sid]["desc"]
+                            if sid in slots:
+                                old_desc = slots[sid]["desc"]
+                                # 버전 문자열 교체 (예: V13 -> V14)
                                 if ":" in old_desc:
                                     prefix, suffix = old_desc.split(":", 1)
-                                    # "[1차] V13" -> "[1차] V24"
                                     if " " in prefix:
                                         p1, p2 = prefix.rsplit(" ", 1)
-                                        live_data["tickers"][t]["slots"][sid]["desc"] = f"{p1} {val}:{suffix}"
+                                        new_desc = f"{p1} {val}:{suffix}"
                                     else:
-                                        live_data["tickers"][t]["slots"][sid]["desc"] = f"{val}:{suffix}"
+                                        new_desc = f"{val}:{suffix}"
+                                    
+                                    # [V14 대응] 2차 슬롯 특수 명칭 처리
+                                    if val == "V14" and sid == "slot_2":
+                                        new_desc = "[2차] 가변보류(Bypass)"
+                                    elif val == "V13" and sid == "slot_1":
+                                        new_desc = "[1차] V13:평단매수"
+                                    elif val == "V14" and sid == "slot_1":
+                                        new_desc = "[1차] V14:평단집중"
+                                        
+                                    slots[sid]["desc"] = new_desc
                         
                     with open(live_file, 'w', encoding='utf-8') as f:
                         json.dump(live_data, f, ensure_ascii=False, indent=4)
@@ -417,6 +423,28 @@ def update_global_strategy(req: dict):
         cfg.set_sniper_defense(val == True)
     elif key == "shadow_bounce":
         cfg.set_shadow_bounce(float(val))
+    elif key == "sniper_drop":
+        cfg.set_sniper_drop(float(val))
+    elif key == "jupjup_density":
+        cfg.set_jupjup_density(int(val))
+    elif key == "rev_day":
+        cfg.set_rev_day(int(val))
+    elif key == "is_reverse":
+        current_tactics = cfg.get_global_tactics()
+        current_tactics["is_reverse"] = (val == True)
+        cfg.set_global_tactics(current_tactics)
+    elif key == "vix_aware":
+        current_tactics = cfg.get_global_tactics()
+        current_tactics["vix_aware"] = (val == True)
+        cfg.set_global_tactics(current_tactics)
+    elif key == "trend_filter":
+        current_tactics = cfg.get_global_tactics()
+        current_tactics["trend_filter"] = (val == True)
+        cfg.set_global_tactics(current_tactics)
+    elif key == "vwap_dominance":
+        current_tactics = cfg.get_global_tactics()
+        current_tactics["vwap_dominance"] = (val == True)
+        cfg.set_global_tactics(current_tactics)
     
     return {"status": "ok", "key": key, "value": val}
 
@@ -650,7 +678,15 @@ def run_simulation(req: dict):
         "shield": req.get("use_shield", True),
         "sniper": req.get("use_sniper", True),
         "emergency": req.get("use_emergency", True),
-        "jupjup": req.get("use_jupjup", False)
+        "jupjup": req.get("use_jupjup", False),
+        "v_shield": req.get("use_v_shield", False),
+        "micro_bounce": req.get("use_micro_bounce", False),
+        "smart_jup": req.get("use_smart_jup", False),
+        "trend_filter": req.get("use_trend_filter", False),
+        "vix_aware": req.get("use_vix_aware", False),
+        "vol_harvest": req.get("use_vol_harvest", False),
+        "vwap_dominance": req.get("use_vwap_dominance", False),
+        "v_rev": req.get("use_v_rev", False),
     }
     
     global_config = {
@@ -782,10 +818,21 @@ async def api_precision_run(req: dict):
         seed = float(req.get("seed", 10000))
         version = req.get("version", "V14")
         
-        modules = req.get("modules", {
-            "turbo": True, "shadow": True, "shield": True, 
-            "sniper": True, "emergency": True, "jupjup": False
-        })
+        # UI에서 보낸 개별 use_xxx 파라미터를 modules 딕셔너리로 통합
+        modules = {
+            "turbo": req.get("use_turbo", True),
+            "shadow": req.get("use_shadow", True),
+            "shield": req.get("use_shield", True),
+            "sniper": req.get("use_sniper", True),
+            "emergency": req.get("use_emergency", True),
+            "jupjup": req.get("use_jupjup", False),
+            "v_shield": req.get("use_v_shield", False),
+            "micro_bounce": req.get("use_micro_bounce", False),
+            "smart_jup": req.get("use_smart_jup", False),
+            "trend_filter": req.get("use_trend_filter", False),
+            "vix_aware": req.get("use_vix_aware", False),
+            "vol_harvest": req.get("use_vol_harvest", False),
+        }
         
         cfg = {
             "split": int(req.get("split", 20)),
@@ -991,3 +1038,82 @@ else:
 # 🚀 [V27-Unified] 이제 main.py에서 한 몸으로 실행됩니다.
 # if __name__ == "__main__":
 #     uvicorn.run(app, host="0.0.0.0", port=5050)
+
+# 🛰️ [V36.0 Advanced] V-REV 전용 초정밀 시뮬레이션 API
+@app.post("/api/simulation/vrev-advanced")
+async def run_vrev_advanced(req: dict):
+    from simulation_engine import VRevResearchSimulator
+    import os
+    import math
+    
+    ticker = req.get("ticker", "SOXL")
+    year = req.get("year", "2022")
+    seed = float(req.get("seed", 10000))
+    config = req.get("config", {})
+    
+    csv_paths = []
+    if year == "5y":
+        years = ["2022", "2023", "2024", "2025", "2026"]
+        for y in years:
+            p = f"/home/jmyoon312/벡테스트 데이터/1min＿{y}.csv"
+            if os.path.exists(p): csv_paths.append(p)
+    else:
+        csv_file = f"/home/jmyoon312/벡테스트 데이터/1min＿{year}.csv"
+        if os.path.exists(csv_file): csv_paths.append(csv_file)
+    
+    if not csv_paths: return {"status": "error", "message": f"데이터 부족: {year}"}
+
+    try:
+        sim = VRevResearchSimulator(ticker, seed, config)
+        history = sim.run_simulation_sequence(csv_paths)
+        
+        if not history: return {"status": "error", "message": "시뮬레이션 결과 데이터가 구성되지 않았습니다."}
+        
+        initial = seed
+        final = float(history[-1]["total"])
+        total_return = ((final - initial) / initial) * 100
+        
+        # 📊 [V50.0] 글로벌 MDD 및 연간 성과 연산
+        peak = 0
+        global_mdd = 0
+        yearly_summary = {}
+        
+        for h in history:
+            val = float(h["total"])
+            if val > peak: peak = val
+            dd = (peak - val) / peak if peak > 0 else 0
+            if dd > global_mdd: global_mdd = dd
+            
+            y_key = h["date"].split("-")[0]
+            if y_key not in yearly_summary:
+                yearly_summary[y_key] = {"start_total": val, "final_total": val, "peak": 0, "mdd": 0}
+            
+            y_s = yearly_summary[y_key]
+            y_s["final_total"] = val
+            if val > y_s["peak"]: y_s["peak"] = val
+            y_dd = (y_s["peak"] - val) / y_s["peak"] if y_s["peak"] > 0 else 0
+            if y_dd > y_s["mdd"]: y_s["mdd"] = y_dd
+
+        for y in yearly_summary:
+            y_s = yearly_summary[y]
+            y_ret = ((y_s["final_total"] - y_s["start_total"]) / y_s["start_total"]) * 100
+            y_s["return"] = round(y_ret, 2)
+            y_s["mdd_pct"] = round(y_s["mdd"] * 100, 2)
+
+        return to_json_serializable({
+            "status": "success",
+            "summary": {
+                "total_return": round(total_return, 2),
+                "final_total": round(final, 2),
+                "mdd_pct": round(global_mdd * 100, 2),
+                "total_days": len(history),
+                "metrics": sim.metrics,
+                "yearly": yearly_summary
+            },
+            "history": history
+        })
+    except Exception as e:
+        import traceback
+        logging.error(f"V-REV Sim Error: {e}\n{traceback.format_exc()}")
+        return {"status": "error", "message": str(e)}
+

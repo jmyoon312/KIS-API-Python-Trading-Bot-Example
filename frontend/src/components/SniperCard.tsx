@@ -27,18 +27,13 @@ export default function SniperCard({ ticker, ledgerData, configData, mode, tacti
   const dayLow = ledgerData?.day_low || 0;
 
   // Star price extraction from orders
-  const starOrder = ledgerData?.orders?.find((o: any) => (o.desc?.includes('별값') || o.desc?.includes('🌟')) && o.price !== undefined);
+  const starOrder = ledgerData?.orders?.find((o: any) => (o.desc?.includes('별값') || o.desc?.includes('🌟') || o.desc?.includes('익절') || o.desc?.includes('보조')) && o.price !== undefined);
   const starPrice = starOrder ? starOrder.price : (avg > 0 ? avg * (1 + (targetPct/100) * 0.85) : 0);
   const starPct = avg > 0 ? ((starPrice - avg) / avg * 100).toFixed(2) : '0.00';
 
   // Sniper line calculations  
   const sniperDown = avg > 0 ? (avg * (1 - targetPct/100)).toFixed(2) : '0.00';
-  const sniperDownPct = avg > 0 ? (-targetPct).toFixed(2) : '0.00';
   const quarterSniper = starPrice > 0 ? starPrice.toFixed(2) : '0.00';
-
-  // Order grouping for display
-  const orders = ledgerData?.orders || [];
-  const bonusOrders = orders.filter((o: any) => o.desc?.includes('줍줍') && !o.desc?.includes('스마트'));
 
 
   return (
@@ -177,25 +172,46 @@ export default function SniperCard({ ticker, ledgerData, configData, mode, tacti
       {/* 1. 스나이퍼 방어선 (Sniper Tactic Only) */}
       {tactics?.sniper && (
         <div className="bg-[#18181b] rounded-xl border border-[#27272a] p-4 mb-4">
-          <h3 className="text-white font-bold text-sm mb-3 flex items-center gap-2">
-            🎯 스나이퍼 방어선
-            {turboMode === 'ON' && !ledgerData?.is_turbo_forced_off && <span className="text-red-400 text-[0.6rem] font-bold">🏎️가속 ON</span>}
-          </h3>
-          <div className="space-y-2 text-sm">
+          <div className="flex justify-between items-center mb-2">
+            <h3 className="text-white font-bold text-sm flex items-center gap-2">
+              🎯 스나이퍼 방어선
+              {turboMode === 'ON' && !ledgerData?.is_turbo_forced_off && <span className="text-red-400 text-[0.6rem] font-bold">🏎️가속 ON</span>}
+            </h3>
+            <span className="text-blue-400 font-black text-xs">{(configData?.sniper_drop || 1.5).toFixed(1)}%</span>
+          </div>
+          
+          <div className="mb-4">
+            <input 
+              type="range" 
+              min="0.5" 
+              max="5.0" 
+              step="0.1" 
+              value={configData?.sniper_drop || 1.5} 
+              onChange={async (e) => {
+                const val = parseFloat(e.target.value);
+                await axios.post('/api/settings/global-strategy', { mode, key: 'sniper_drop', value: val });
+                onRefresh();
+              }}
+              className="w-full accent-blue-500 h-1.5 bg-[#27272a] rounded-lg appearance-none cursor-pointer mb-2" 
+            />
+            <p className="text-[0.6rem] text-gray-500">수익권에서 고점 대비 설정값 하락 시 즉시 1/4 익절 격발</p>
+          </div>
+
+          <div className="space-y-2 text-sm border-t border-white/5 pt-3">
             <div className="flex justify-between items-center">
-              <span className="text-gray-400">📉 스나이퍼({sniperDownPct}%)</span>
-              <span className="text-blue-400 font-bold tabular-nums">${sniperDown} 이하 대기</span>
+              <span className="text-gray-400">📉 수익방어 격발선</span>
+              <span className="text-blue-400 font-bold tabular-nums">${sniperDown} 이하</span>
             </div>
             <div className="flex justify-between items-center">
               <span className="text-gray-400">🦇 쿼터 스나이퍼</span>
-              <span className="text-yellow-500 font-bold tabular-nums">${quarterSniper} 이상 대기</span>
+              <span className="text-yellow-500 font-bold tabular-nums">${quarterSniper} 이상</span>
             </div>
           </div>
         </div>
       )}
 
-      {/* 2. 새도우 스트라이크 반등 비율 조절 (Shadow Tactic Only - Global Setting) */}
-      {tactics?.shadow && (
+      {/* 2. 새도우 스트라이크 반등 비율 조절 (Shadow Tactic OR V24 Hybrid) */}
+      {(tactics?.shadow || version === 'V24') && (
         <div className="bg-[#18181b] rounded-xl border border-[#27272a] p-4 mb-4 animate-fade-in">
           <div className="flex justify-between items-center mb-2">
             <h3 className="text-white font-bold text-sm flex items-center gap-2">
@@ -214,7 +230,7 @@ export default function SniperCard({ ticker, ledgerData, configData, mode, tacti
               value={configData?.shadow_bounce || 1.5} 
               onChange={async (e) => {
                 const val = parseFloat(e.target.value);
-                await axios.post('/api/settings/global', { mode, key: 'shadow_bounce', value: val });
+                await axios.post('/api/settings/global-strategy', { mode, key: 'shadow_bounce', value: val });
                 onRefresh();
               }}
               className="flex-1 accent-purple-500 h-1.5 bg-[#27272a] rounded-lg appearance-none cursor-pointer" 
@@ -245,22 +261,89 @@ export default function SniperCard({ ticker, ledgerData, configData, mode, tacti
               🧹 줍줍 거미줄 현황
             </h3>
             <span className="text-yellow-500 font-black text-xs">
-              {bonusOrders.length}건 대기 중
+              {(configData?.jupjup_density || 10)}개 감시 중
             </span>
           </div>
-          <div className="flex items-center gap-2">
+
+          <div className="mb-4">
+            <input 
+              type="range" 
+              min="1" 
+              max="20" 
+              step="1" 
+              value={configData?.jupjup_density || 10} 
+              onChange={async (e) => {
+                const val = parseInt(e.target.value);
+                await axios.post('/api/settings/global-strategy', { mode, key: 'jupjup_density', value: val });
+                onRefresh();
+              }}
+              className="w-full accent-yellow-500 h-1.5 bg-[#27272a] rounded-lg appearance-none cursor-pointer mb-2" 
+            />
+            <div className="flex justify-between text-[0.6rem] text-gray-500">
+              <span>밀도 낮음</span>
+              <span>밀도 높음 (20개)</span>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2 border-t border-yellow-500/10 pt-3">
             <div className="flex-1 h-1.5 bg-[#27272a] rounded-full overflow-hidden">
                <div 
                 className="h-full bg-yellow-500 transition-all duration-1000" 
-                style={{ width: `${Math.min(100, (bonusOrders.length / 10) * 100)}%` }}
+                style={{ width: `${Math.min(100, ((configData?.jupjup_density || 10) / 20) * 100)}%` }}
                ></div>
             </div>
-            <span className="text-[0.6rem] text-gray-500 font-bold">거미줄 밀도: {bonusOrders.length > 0 ? 'High' : 'Standby'}</span>
+            <span className="text-[0.6rem] text-gray-500 font-bold">밀도: { (configData?.jupjup_density || 10) > 15 ? 'High' : ((configData?.jupjup_density || 10) > 7 ? 'Mid' : 'Low')}</span>
           </div>
         </div>
       )}
 
-      {/* 📋 주문 계획 (Telegram 포맷 일치) */}
+      {/* 5. V-REV 리버스 순환 모드 (Reverse Mode Only) */}
+      {tactics?.is_reverse && (
+        <div className="bg-purple-900/10 rounded-xl border border-purple-500/30 p-4 mb-4 animate-pulse">
+          <div className="flex justify-between items-center mb-3">
+            <h3 className="text-white font-bold text-sm flex items-center gap-2">
+              🔄 V-REV 리버스 가동 중
+            </h3>
+            <div className="flex items-center gap-2 bg-[#1c1c1f] rounded-lg p-1 border border-[#27272a]">
+              <button 
+                onClick={async () => {
+                  const current = tactics?.rev_day || 0;
+                  const newVal = Math.max(0, current - 1);
+                  await axios.post('/api/settings/global-strategy', { mode, key: 'rev_day', value: newVal });
+                  onRefresh();
+                }}
+                className="w-6 h-6 flex items-center justify-center text-gray-400 hover:text-white hover:bg-[#27272a] rounded transition-colors"
+              >-</button>
+              <span className="text-purple-400 font-bold text-xs w-12 text-center">
+                {tactics?.rev_day || 0}일차
+              </span>
+              <button 
+                onClick={async () => {
+                  const current = tactics?.rev_day || 0;
+                  const newVal = current + 1;
+                  await axios.post('/api/settings/global-strategy', { mode, key: 'rev_day', value: newVal });
+                  onRefresh();
+                }}
+                className="w-6 h-6 flex items-center justify-center text-gray-400 hover:text-white hover:bg-[#27272a] rounded transition-colors"
+              >+</button>
+            </div>
+          </div>
+          <p className="text-[0.65rem] text-purple-300 leading-relaxed opacity-80 mb-2">
+            현재 평단가 부근에서 물량을 털어내며 순환 매수/매도를 반복하는 탈출 모드입니다. 
+            (매일 { (tactics?.rev_day || 0) === 1 ? '시장가 매도' : '별값 매칭 매매' } 진행)
+          </p>
+          <div className="grid grid-cols-2 gap-2 mt-3">
+            <div className={`text-[0.6rem] p-1.5 rounded border ${tactics?.vix_aware ? 'bg-blue-500/10 border-blue-500/30 text-blue-300' : 'bg-gray-800/10 border-gray-700/30 text-gray-500'}`}>
+               ⚡ VIX-Aware: {tactics?.vix_aware ? 'ON' : 'OFF'}
+            </div>
+            <div className={`text-[0.6rem] p-1.5 rounded border ${tactics?.vwap_dominance ? 'bg-orange-500/10 border-orange-500/30 text-orange-300' : 'bg-gray-800/10 border-gray-700/30 text-gray-500'}`}>
+               📊 VWAP-Eng: {tactics?.vwap_dominance ? 'ON' : 'OFF'}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 📋 주문 계획 (Planned Orders) */}
       <div className="bg-[#18181b] rounded-xl border border-[#27272a] p-4 mb-4">
         <div className="flex justify-between items-center mb-3">
           <h3 className="text-white font-bold text-sm flex items-center gap-2">
@@ -270,7 +353,6 @@ export default function SniperCard({ ticker, ledgerData, configData, mode, tacti
           <span className="text-gray-600 text-[0.6rem] font-bold tracking-wider uppercase">{version}</span>
         </div>
         
-        {/* 🚀 [V25] 5개 고정 슬롯 렌더링 (5-Slot Fixed UI) */}
         <div className="space-y-4 mb-3">
           {[1, 2, 3, 4, 5].map((num) => {
             const sid = `slot_${num}`;
@@ -285,43 +367,91 @@ export default function SniperCard({ ticker, ledgerData, configData, mode, tacti
             );
 
             const isFilled = slot.status === 'FILLED';
-            const dotColor = isFilled ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.6)]' : (slot.side === 'SELL' ? (slot.desc?.includes('목표') ? 'bg-purple-500' : 'bg-blue-500') : 'bg-red-500');
-            const textColor = isFilled ? 'text-green-400' : (slot.side === 'SELL' ? (slot.desc?.includes('목표') ? 'text-purple-400' : 'text-blue-400') : 'text-red-400');
+            const isActive = slot.qty > 0 || isFilled;
+            
+            // BUY/SELL 색상 구분
+            const isSell = slot.side === 'SELL';
+            let dotColor = 'bg-red-500';
+            let textColor = 'text-red-400';
+            
+            if (isFilled) {
+              dotColor = 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.6)]';
+              textColor = 'text-green-400';
+            } else if (isSell) {
+              const isGoal = slot.desc?.includes('목표') || slot.desc?.includes('전량');
+              dotColor = isGoal ? 'bg-purple-500 shadow-[0_0_8px_rgba(168,85,247,0.4)]' : 'bg-blue-500 shadow-[0_0_8px_rgba(59,130,246,0.4)]';
+              textColor = isGoal ? 'text-purple-400' : 'text-blue-400';
+            } else {
+              dotColor = 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.3)]';
+              textColor = 'text-red-400';
+            }
 
             return (
-              <div key={sid} className={`flex items-start gap-2.5 transition-all duration-500 ${isFilled ? 'bg-green-500/5 -mx-2 px-2 py-1 rounded-lg border border-green-500/20 shadow-inner' : ''}`}>
-                <div className={`w-2.5 h-2.5 rounded-full ${dotColor} mt-1.5 flex-shrink-0 transition-colors`}></div>
+              <div key={sid} className={`flex items-start gap-2.5 transition-all duration-500 ${isFilled ? 'bg-green-500/5 -mx-2 px-2 py-1 rounded-lg border border-green-500/20' : ''} ${!isActive ? 'opacity-30 grayscale-[0.5]' : ''}`}>
+                <div className={`w-2.5 h-2.5 rounded-full ${dotColor} mt-1.5 flex-shrink-0`}></div>
                 <div className="flex-1 min-w-0">
                   <div className="flex justify-between items-center mb-0.5">
                     <div className={`font-bold text-sm ${textColor} flex items-center gap-1.5`}>
                       {slot.desc}
                       {isFilled && <span className="text-[10px] font-black bg-green-500 text-black px-1 rounded animate-bounce">DONE</span>}
-                      {slot.result && <span className="text-[10px] opacity-60 font-medium">({slot.result})</span>}
+                      {slot.result && <span className="text-[10px] opacity-60 font-medium whitespace-nowrap">({slot.result})</span>}
                     </div>
                   </div>
-                  <div className="text-gray-400 text-xs tabular-nums flex justify-between items-center pr-1">
-                    <span>
-                      └ ${slot.price?.toFixed(2) || '0.00'} x {slot.qty}주
-                      <span className="text-gray-600 ml-1.5 opacity-50">({slot.type || 'LOC'})</span>
-                    </span>
-                    {isFilled && <span className="text-[0.6rem] text-green-600/80 font-black uppercase tracking-widest">Completed Today</span>}
+                  <div className="text-gray-400 text-xs tabular-nums">
+                    └ ${slot.price?.toFixed(2) || '0.00'} x {slot.qty}주
+                    <span className="text-gray-600 ml-1.5 opacity-50">({slot.type || 'LOC'})</span>
                   </div>
                 </div>
               </div>
             );
           })}
         </div>
+      </div>
 
-        {ledgerData?.slots === undefined && orders.length === 0 && (
-          <div className="text-gray-500 text-sm py-3 text-center">진행 중인 주문 계획이 없습니다.</div>
-        )}
+      {/* ✅ 당일 매매 완료 (Execution History) */}
+      <div className="bg-green-500/5 rounded-xl border border-green-500/10 p-4 mb-4 border-dashed animate-fade-in outline outline-1 outline-green-500/10">
+        <div className="flex justify-between items-center mb-4">
+          <h3 className="text-green-500 font-bold text-[0.7rem] flex items-center gap-2">
+            <span className="flex h-2 w-2 relative">
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
+              <span className="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span>
+            </span>
+            당일 매매 완료 내역
+          </h3>
+          <span className="text-[0.55rem] text-green-700/80 font-black uppercase tracking-[0.2em]">EXECUTION SUCCESS</span>
+        </div>
 
-        {/* Lock status */}
-        {ledgerData?.is_locked && (
-          <div className="mt-3 bg-green-900/10 border border-green-800/30 rounded-lg px-3 py-2 text-green-400 text-xs font-medium flex items-center gap-1.5">
-            ✅ 금일 주문 완료/잠금
-          </div>
-        )}
+        <div className="space-y-3">
+          {[1, 2, 3, 4, 5].map((num) => {
+            const sid = `slot_${num}`;
+            const slot = ledgerData?.slots?.[sid];
+            if (!slot || slot.status !== 'FILLED') return null;
+
+            return (
+              <div key={sid} className="flex items-start gap-2.5 bg-green-500/5 -mx-1 px-2 py-2 rounded-lg border border-green-500/20 transition-all duration-700 shadow-sm">
+                <div className="w-2.5 h-2.5 rounded-full bg-green-500 shadow-[0_0_10px_rgba(34,197,94,0.4)] mt-1.5 flex-shrink-0"></div>
+                <div className="flex-1 min-w-0">
+                  <div className="flex justify-between items-center mb-0.5">
+                    <div className="font-bold text-sm text-green-400 flex items-center gap-1.5">
+                      {slot.desc}
+                      <span className="text-[0.55rem] font-bold text-green-600/60 opacity-80">(Slot {num})</span>
+                    </div>
+                  </div>
+                  <div className="text-green-700/70 text-xs tabular-nums flex justify-between items-center">
+                    <span>└ <span className="text-green-500 font-bold">${slot.price?.toFixed(2)}</span> 단가로 <span className="text-green-500 font-bold">{slot.qty}주</span> 체결 완료</span>
+                    <span className="text-[0.55rem] font-black bg-green-500/10 px-1 rounded border border-green-500/20 italic">DONE</span>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+          
+          {(!ledgerData?.slots || Object.values(ledgerData.slots).every((s: any) => s.status !== 'FILLED')) && (
+            <div className="text-gray-700/50 text-[0.6rem] py-4 text-center border border-dashed border-gray-800/20 rounded-lg italic">
+              현재 체결된 내역이 없습니다. (실시간 감시 중)
+            </div>
+          )}
+        </div>
       </div>
 
       {/* 거래 내역 (간략) */}

@@ -89,15 +89,15 @@ class TradingEngine:
         self.cfg = ConfigManager(is_real=self.is_real)
         if admin_chat_id: self.cfg.set_chat_id(admin_chat_id)
         
-        self.broker = KoreaInvestmentBroker(app_key, app_secret, cano, acnt_prdt_cd, is_real=self.is_real)
+        self.broker = KoreaInvestmentBroker(self.cfg, app_key, app_secret, cano, acnt_prdt_cd, is_real=self.is_real)
         self.strategy = InfiniteStrategy(self.cfg)
         self.tx_lock = asyncio.Lock()
         
         # 텔레그램 컨트롤러 초기화 (단일 엔진 전용)
         self.bot_controller = TelegramController(self.cfg, self.broker, self.strategy, self.mode_name, self.tx_lock)
         
-        # 텔레그램 애플리케이션 빌드
-        self.app = Application.builder().token(telegram_token).build()
+        # 텔레그램 애플리케이션 빌드 (타임아웃 강화)
+        self.app = Application.builder().token(telegram_token).connect_timeout(30.0).read_timeout(30.0).build()
         
         # [V24] 백그라운드 발송을 위해 봇 객체 주입
         self.bot_controller.set_bot(self.app.bot)
@@ -169,7 +169,18 @@ class TradingEngine:
 
     async def start(self):
         logging.info(f"🚀 [{self.mode_name}] 엔진 가동 시작...")
-        await self.app.initialize()
+        
+        # 🛡️ [V29.8] 텔레그램 초기화 타임아웃을 대비한 재시도 래퍼
+        for attempt in range(3):
+            try:
+                await self.app.initialize()
+                break
+            except Exception as e:
+                logging.warning(f"⚠️ [{self.mode_name}] 텔레그램 통신 초기화 실패 (시도 {attempt+1}/3): {str(e)[:50]}")
+                if attempt == 2:
+                    logging.error("🚨 텔레그램 통신 불가. 엔진 가동을 중단하거나 타임아웃을 연장하세요.")
+                await asyncio.sleep(2)
+        
         # 🧪 [V23.1] 엔진 기동 직후 즉각적인 데이터 동기화 수행
         # 🚨 [V26.4 Fix] type('obj',...)은 클래스를 생성하므로 인스턴스 속성 접근 시 에러 발생.
         # 이를 보완하기 위해 명시적인 객체 구조를 생성합니다.
@@ -201,10 +212,10 @@ class TradingEngine:
             if self.app.updater:
                 await self.app.updater.start_polling(drop_pending_updates=True)
             # 🚀 [V33 Unified] 엔진 가동 알림
-            self.cfg.log_event("SYSTEM", "INIT", "SUCCESS", f"[{self.mode_name}] 엔진 가동", details="텔레그램 봇(수동 폴링) 및 스케줄러 활성화 완료")
+            self.cfg.log_event("SCHEDULE", "INIT", "SUCCESS", f"[{self.mode_name}] 엔진 가동", details="텔레그램 봇(수동 폴링) 및 스케줄러 활성화 완료")
         except Exception as e:
             logging.error(f"🚨 [{self.mode_name}] 텔레그램 봇 가동 실패: {e}")
-            self.cfg.log_event("SYSTEM", "INIT", "ERROR", f"[{self.mode_name}] 봇 기동 실패", details=str(e))
+            self.cfg.log_event("SCHEDULE", "INIT", "ERROR", f"[{self.mode_name}] 봇 기동 실패", details=str(e))
         
     async def stop(self):
         logging.info(f"🛑 [{self.mode_name}] 엔진 정지 중...")
@@ -349,6 +360,21 @@ async def scheduled_force_reset(context):
         app_data['cfg'].clear_events()
         app_data['cfg'].reset_locks()
         
+        # 🧹 [V26.9] 상황실 주문 및 체결 내역 초기화 (새로운 거래일 시작)
+        try:
+            live_file = app_data['cfg']._get_file_path("LIVE_STATUS")
+            if os.path.exists(live_file):
+                with open(live_file, 'r', encoding='utf-8') as f:
+                    live_data = json.load(f)
+                if "tickers" in live_data:
+                    for t in live_data["tickers"]:
+                        live_data["tickers"][t]["slots"] = {}
+                with open(live_file, 'w', encoding='utf-8') as f:
+                    json.dump(live_data, f, ensure_ascii=False, indent=2)
+                logging.info(f"✨ [{mode}] 상황실 주문 및 매매 내역 초기화 완료")
+        except Exception as reset_e:
+            logging.error(f"⚠️ 상황실 초기화 중 오류: {reset_e}")
+        
         for t in app_data['cfg'].get_active_tickers():
             app_data['cfg'].increment_reverse_day(t)
             
@@ -358,7 +384,7 @@ async def scheduled_force_reset(context):
         await context.bot.send_message(chat_id=context.job.chat_id, text=f"🔓 <b>[{mode}] [{target_hour}:00] 시스템 초기화 완료 (매매 잠금 해제 & 스나이퍼 장전 & 리버스 카운트 누적)</b>", parse_mode='HTML')
     except Exception as e:
         update_task_status(app_data['mode'], "pre", "error")
-        app_data['cfg'].log_event("SYSTEM", "ERROR", "FAILURE", f"시스템 초기화 실패", details=str(e))
+        app_data['cfg'].log_event("SCHEDULE", "ERROR", "FAILURE", f"시스템 초기화 실패", details=str(e))
         await context.bot.send_message(chat_id=context.job.chat_id, text=f"🚨 <b>시스템 초기화 중 에러 발생:</b> {e}", parse_mode='HTML')
 
 async def scheduled_premarket_monitor(context):
@@ -396,7 +422,7 @@ async def scheduled_premarket_monitor(context):
                 
                 gap_pct = (curr_p - prev_c) / prev_c * 100
                 # 🛡️ [V33 Deduplication] 가격 체크 로그는 log_event 내부 Throttling에 의해 15분에 한 번만 기록됨
-                cfg.log_event("SYSTEM", "PRE", "SUCCESS", f"[{t}] 프리마켓 가격 체크", details=f"현재가: ${curr_p}, 전일종가: ${prev_c} (GAP: {gap_pct:+.2f}%)")
+                cfg.log_event("SCHEDULE", "PRE", "SUCCESS", f"[{t}] 프리마켓 가격 체크", details=f"현재가: ${curr_p}, 전일종가: ${prev_c} (GAP: {gap_pct:+.2f}%)")
                 
                 # 1. 갭상승 익절 체크 (+3% 이상 갭업 & 목표 도달 여부) (보유수량 있을때만)
                 if int(h['qty']) > 0 and gap_pct >= 3.0:
@@ -414,7 +440,7 @@ async def scheduled_premarket_monitor(context):
                             msg += f"\n└ {o['desc']} {o['side']} {o['qty']}주: {'✅' if is_success else f'❌({err_msg})'}"
                             await asyncio.sleep(0.2) 
                         await context.bot.send_message(chat_id=context.job.chat_id, text=msg, parse_mode='HTML')
-                        cfg.log_event("RESET", "SUCCESS" if all_success else "ERROR", f"[{t}] 조기 익절 실행", details=msg.replace('<b>','').replace('</b>',''))
+                        cfg.log_event("SCHEDULE", "SUCCESS" if all_success else "ERROR", f"[{t}] 조기 익절 실행", details=msg.replace('<b>','').replace('</b>',''))
                         
                         if all_success:
                             # 텔레그램 봇의 process_sync를 호출하여 즉각 리밸런싱을 유도할 수 있도록 안내
@@ -860,19 +886,13 @@ async def scheduled_live_sync(context):
                     rem_sell_qty = actual_qty
                     
                     for sid in ["slot_1", "slot_2", "slot_3", "slot_4", "slot_5"]:
-                        # 1. 기존 슬롯의 FILLED 상태 및 값 복원 (상태 보관)
+                        # 1. 기존 슬롯의 FILLED 상태 및 체결 정보 복원 (데이터 동결)
                         if old_slots.get(sid, {}).get("status") == "FILLED":
                             new_slots[sid]["status"] = "FILLED"
                             new_slots[sid]["result"] = old_slots[sid].get("result", "✅체결")
                             new_slots[sid]["price"] = old_slots[sid].get("price", 0)
-                            
-                            old_q = int(old_slots[sid].get("qty", 0))
-                            if sid in ["slot_4", "slot_5"]:
-                                allocated_q = min(rem_sell_qty, old_q)
-                                new_slots[sid]["qty"] = allocated_q
-                                rem_sell_qty -= max(0, allocated_q)
-                            else:
-                                new_slots[sid]["qty"] = old_q
+                            new_slots[sid]["desc"] = old_slots[sid].get("desc", new_slots[sid]["desc"]) # 🛡️ [V26.9] 체결 시점 명칭 보존
+                            new_slots[sid]["qty"] = old_slots[sid].get("qty", new_slots[sid]["qty"])   # 🛡️ [V26.9] 체결 시점 수량 보존
                         else:
                             # 2. 미체결 매도 슬롯도 잔여 잔고 임계치 적용
                             if sid in ["slot_4", "slot_5"]:
@@ -956,7 +976,7 @@ async def scheduled_live_sync(context):
             if app_data.get('force_live_sync'):
                 app_data['force_live_sync'] = False
                 # 🚀 [V28.1] 수동 갱신 시에는 큐를 우회하여 즉시 기록 (UI 즉각 반영 보장)
-                cfg.log_event("SYNC", "SYNC", "SUCCESS", "수동 데이터 동기화 완료")
+                cfg.log_event("SCHEDULE", "SYNC", "SUCCESS", "수동 데이터 동기화 완료")
             update_task_status(mode, "sync", "done")
         except: pass
     
@@ -1092,7 +1112,7 @@ async def switch_trading_mode(context, new_mode):
         else:
             k, s, c, p = MOCK_APP_KEY, MOCK_APP_SECRET, MOCK_CANO, MOCK_ACNT_PRDT_CD
             
-        new_broker = KoreaInvestmentBroker(k, s, c, p, is_real=new_mode)
+        new_broker = KoreaInvestmentBroker(cfg, k, s, c, p, is_real=new_mode)
         new_strategy = InfiniteStrategy(cfg)
         
         # 3. 글로벌 app_data 업데이트 (모든 태스크가 이 시점부터 새 브로커 사용)
@@ -1298,6 +1318,14 @@ async def scheduled_sniper_monitor(context):
                 star_ratio = (target_pct_val / 100.0) - ((target_pct_val / 100.0) * depreciation_factor * t_val)
                 star_price = math.ceil(avg_price * (1 + star_ratio) * 100) / 100.0
                 
+                # 🛡️ [V26.9] 당일 보호 원칙: 오늘 매수한 종목은 실시간 목표가 돌파(Jackpot/별값) 감시에서 제외 (최소 1박 숙성)
+                kor_today = datetime.datetime.now(pytz.timezone('Asia/Seoul')).strftime('%Y-%m-%d')
+                last_buy_date = cfg.get_last_split_date(t)
+                is_protected_today = (last_buy_date == kor_today)
+
+                if is_protected_today:
+                    continue
+
                 if not lock_sell and curr_p >= target_price:
                     await asyncio.to_thread(broker.cancel_all_orders_safe, t, side="SELL")
                     await asyncio.sleep(1.0)
@@ -1553,7 +1581,7 @@ async def scheduled_regular_trade(context):
     app_data = context.job.data
     cfg, broker, strategy, tx_lock = app_data['cfg'], app_data['broker'], app_data['strategy'], app_data['tx_lock']
     latest_version = cfg.get_latest_version()
-    cfg.log_event("STATUS", "REG", "START", f"🔥 [{target_hour}:30] 정규장 주문 스케줄 실행 ({latest_version})")
+    cfg.log_event("SCHEDULE", "REG", "START", f"🔥 [{target_hour}:30] 정규장 주문 스케줄 실행 ({latest_version})")
     await context.bot.send_message(chat_id=chat_id, text=f"🌃 <b>[{target_hour}:30] 다이내믹 스노우볼 {latest_version} 정규장 주문을 준비합니다.</b>", parse_mode='HTML')
     
     async def _do_regular_trade():
@@ -1586,7 +1614,18 @@ async def scheduled_regular_trade(context):
                         continue
 
                     res = broker.send_order(t, o['side'], o['qty'], o['price'], o['type'])
-                    if res.get('rt_cd') != '0': all_success[t] = False
+                    if res.get('rt_cd') == '888':
+                        msgs[t] += "🚫 <b>모의투자 휴장일 감지: 필수 주문 전송 취소</b>\n"
+                        all_success[t] = False
+                        break
+                    
+                    if res.get('rt_cd') == '0':
+                        # 🛡️ [V26.9] 매수 성공 시 날짜 기록 (당일 보호 로직 연동)
+                        kor_today = datetime.datetime.now(pytz.timezone('Asia/Seoul')).strftime('%Y-%m-%d')
+                        cfg.set_last_split_date(t, kor_today)
+                    else:
+                        all_success[t] = False
+
                     msgs[t] += f"└ 1차 필수: {o['desc']} {o['qty']}주: {'✅' if res.get('rt_cd') == '0' else f'❌({res.get('msg1')})'}\n"
                     await asyncio.sleep(0.2) 
 
@@ -1627,7 +1666,7 @@ async def scheduled_regular_trade(context):
         update_task_status(app_data['mode'], "reg", "done")
     except Exception as e:
         update_task_status(app_data['mode'], "reg", "error")
-        cfg.log_event("SYSTEM", "ERROR", "FAILURE", f"정규장 매매 엔진 오류", details=str(e)[:50])
+        cfg.log_event("SCHEDULE", "ERROR", "FAILURE", f"정규장 매매 엔진 오류", details=str(e)[:50])
         logging.error(f"🚨 정규장 매매 에러: {e}")
 
 async def scheduled_auto_sync_summer(context):
@@ -1667,6 +1706,18 @@ async def scheduled_analytics_snapshot(context):
     app_data = context.job.data
     cfg, broker, tx_lock = app_data['cfg'], app_data['broker'], app_data['tx_lock']
     chat_id = context.job.chat_id
+    
+    import json
+    LIVE_FILE = cfg._get_file_path("LIVE_STATUS")
+    live_data = {"tickers": {}}
+    if os.path.exists(LIVE_FILE):
+        try:
+            with open(LIVE_FILE, 'r', encoding='utf-8') as f:
+                loaded_data = json.load(f)
+                if isinstance(loaded_data, dict):
+                    live_data = loaded_data
+        except: pass
+
     try:
         async with tx_lock:
             cash, holdings = await asyncio.to_thread(broker.get_account_balance)
@@ -1725,7 +1776,7 @@ async def scheduled_analytics_snapshot(context):
             f"✅ 성과 분석 및 임시 장부 기록이 완료되었습니다."
         )
         await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='HTML')
-        cfg.log_event("SNAPSHOT", "SNAPSHOT", "SUCCESS", f"일일 분석 스냅샷 저장 완료 (${snap['total']:,.0f})")
+        cfg.log_event("SCHEDULE", "SNAPSHOT", "SUCCESS", f"일일 분석 스냅샷 저장 완료 (${snap['total']:,.0f})")
         update_task_status(app_data['mode'], "after", "done")
         logging.info(f"📊 [Analytics] Daily snapshot recorded: ${snap['total']:,.2f}")
         

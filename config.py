@@ -64,6 +64,9 @@ class ConfigManager:
             "LIVE_STATUS": "live_status.json",
             "GLOBAL_TACTICS": "global_tactics.json", # 🛡️ [V25] 글로벌 전술 설정
             "SHADOW_BOUNCE": "shadow_bounce.dat",   # 🌓 [V25] 전술 상세 속성 분리
+            "SNIPER_DROP": "sniper_drop.dat",
+            "JUPJUP_DENSITY": "jupjup_density.dat",
+            "REV_DAY": "rev_day.dat",
             "ENGINE_STATUS": "engine_status.dat",
             "REFRESH_TRIGGER": "refresh_needed.tmp",
             "EVENT_LOG": "event_log.json",
@@ -1188,18 +1191,58 @@ class ConfigManager:
     def set_sniper_defense(self, v):
         self._save_file("SNIPER_DEFENSE", str(v))
 
+    def get_sniper_drop(self):
+        val = self._load_file("SNIPER_DROP")
+        return float(val) if val else 1.5 # 최적 기본값 1.5%
+
+    def set_sniper_drop(self, v):
+        self._save_file("SNIPER_DROP", str(v))
+
+    def get_jupjup_density(self):
+        val = self._load_file("JUPJUP_DENSITY")
+        return int(val) if val else 10 # 최적 기본값 10개
+
+    def set_jupjup_density(self, v):
+        self._save_file("JUPJUP_DENSITY", str(v))
+
+    def get_rev_day(self):
+        val = self._load_file("REV_DAY")
+        return int(val) if val else 0
+
+    def set_rev_day(self, v):
+        self._save_file("REV_DAY", str(v))
+
     # 🏹 [V25] 글로벌 전술 관리 (Tactical Command Center 연동)
     def get_global_tactics(self):
+        # 🛡️ 최적의 기본 전술 설정
         default = {
             "shield": False,
             "shadow": False,
             "turbo": False,
-            "sniper": False, 
-            "jupjup": False
+            "sniper": True,          # 🎯 스나이퍼 기본 활성화
+            "jupjup": False,
+            "is_reverse": False,     # 🔄 V-REV 모드 (기본 꺼짐)
+            "vix_aware": True,      # ⚡ VIX 지수 연동 (기본 켜짐 - 보호)
+            "trend_filter": False,   # 🔻 하락 트렌드 필터
+            "vwap_dominance": False, # 📊 VWAP 지배력 분석
+            "rev_day": 0             # 🔄 리버스 일차 통합
         }
-        return self._load_json("GLOBAL_TACTICS", default)
+        loaded = self._load_json("GLOBAL_TACTICS", default)
+        
+        # 🔗 [V25.1] 기존 파일에 누락된 새로운 키가 있으면 기본값에서 채워넣음 (Deep Merge 형태)
+        for k, v in default.items():
+            if k not in loaded:
+                loaded[k] = v
+        
+        # 🔄 rev_day는 별도 파일 값이 최신이므로 동기화
+        loaded["rev_day"] = self.get_rev_day()
+        
+        return loaded
 
     def set_global_tactics(self, tactics):
+        # 만약 tactics 안에 rev_day가 있으면 별도 파일에도 저장
+        if "rev_day" in tactics:
+            self.set_rev_day(tactics["rev_day"])
         self._save_json("GLOBAL_TACTICS", tactics)
 
     def get_active_tickers(self):

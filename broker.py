@@ -19,7 +19,8 @@ class KoreaInvestmentBroker:
     # ⚡ [V24 Shared Cache] 모으/실전 간 가격 불일치 해소 및 API 부하 절감을 위한 클래스 레벨 공유 캐시
     _price_cache = {} # {ticker: (timestamp, data)}
 
-    def __init__(self, app_key, app_secret, cano, acnt_prdt_cd="01", is_real=False):
+    def __init__(self, cfg, app_key, app_secret, cano, acnt_prdt_cd="01", is_real=False):
+        self.cfg = cfg # 📋 [V33.5] 통합 로깅 전용 설정 매니저 주입
         self.app_key = app_key
         self.app_secret = app_secret
         self.cano = cano
@@ -102,13 +103,16 @@ class KoreaInvestmentBroker:
     def _api_request(self, method, url, headers, params=None, data=None):
         """🌟 [V22.2 Bulldog Engine] 5회 리트라이 및 유량 제한 대응용 강화 엔진"""
         # 🚀 [V29.8 Optimization] 모의투자 리트라이 단축 (동기화 병목 방어)
-        max_retries = 3 if not getattr(self, 'is_real', True) else 5
+        is_real = getattr(self, 'is_real', True)
+        max_retries = 5 if is_real else 2
+        req_timeout = 5 if is_real else 3
+        
         for attempt in range(max_retries):
             try:
                 if method.upper() == "GET":
-                    res = requests.get(url, headers=headers, params=params, timeout=5)
+                    res = requests.get(url, headers=headers, params=params, timeout=req_timeout)
                 else:
-                    res = requests.post(url, headers=headers, data=json.dumps(data) if data else None, timeout=5)
+                    res = requests.post(url, headers=headers, data=json.dumps(data) if data else None, timeout=req_timeout)
                 
                 # HTTP 상태 코드 확인 (429: 유량제한, 500대: 서버오류)
                 if res.status_code == 429 or res.status_code >= 500:
@@ -453,7 +457,12 @@ class KoreaInvestmentBroker:
         target_opps = [o for o in opp_orders if o.get('sll_buy_dvsn_cd') == opp_cd]
         
         if target_opps:
-            print(f"⚔️ [Wash-protect] {ticker} {side} 주문 전 반대 주문({len(target_opps)}건) 발견! 자동 취소 후 진행합니다.")
+            msg = f"⚔️ [Wash-protect] {ticker} {side} 주문 전 반대 주문({len(target_opps)}건) 발견! 자동 취소 후 진행합니다."
+            print(msg)
+            # 🚀 [V33.5] 워시트레이드 방지 내역도 사용자 알림 피드에 기록
+            if self.cfg:
+                self.cfg.log_event("TRADE", "WASH", "INFO", f"[{ticker}] 워시트레이드 보호 가동", details=f"반대 주문 {len(target_opps)}건 선제 취소")
+            
             for o in target_opps:
                 self.cancel_order(ticker, o.get('odno'))
                 time.sleep(0.3)
@@ -495,6 +504,13 @@ class KoreaInvestmentBroker:
         res = self._call_api(tr_id, "/uapi/overseas-stock/v1/trading/order", "POST", body=body)
         
         rt_cd = res.get('rt_cd', '999')
+        # 🚀 [V33.5] 모든 개별 주문 내역을 실시간 피드(TRADE)에 기록 (상황실 자동 연동)
+        if self.cfg:
+            status = "SUCCESS" if rt_cd == "0" else "ERROR"
+            order_label = "매수" if side == "BUY" else "매도"
+            msg = f"[{ticker}] {order_label} {int(qty)}주 ({order_type})"
+            detail = f"단가: ${final_price:.2f} ({res.get('msg1', '응답 없음')})"
+            self.cfg.log_event("TRADE", order_type.upper(), status, msg, details=detail)
         msg1 = res.get('msg1', '오류')
         output = res.get('output', {})
         odno = output.get('ODNO', '') if isinstance(output, dict) else ''
@@ -502,7 +518,11 @@ class KoreaInvestmentBroker:
         if rt_cd == '0':
             print(f"✅ [Order] {self.mode_tag} {ticker} {side} ${final_price} {qty}주 주문 성공 (ODNO: {odno})")
         else:
-            print(f"❌ [Order] {self.mode_tag} {ticker} {side} 주문 실패: {msg1}")
+            if "영업일이 아닙니다" in msg1:
+                rt_cd = '888'
+                print(f"🚫 [Order] {self.mode_tag} {ticker} {side} 주문 거부: 모의투자 영업일 아님 (우회 차단)")
+            else:
+                print(f"❌ [Order] {self.mode_tag} {ticker} {side} 주문 실패: {msg1}")
             
         return {'rt_cd': rt_cd, 'msg1': msg1, 'odno': odno}
 

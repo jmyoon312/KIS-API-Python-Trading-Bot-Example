@@ -3,7 +3,12 @@
 # ⚠️ 이 주석 및 파일명 표기는 절대 지우지 마세요.
 # ==========================================================
 import math
-from datetime import datetime
+import pandas as pd
+import logging
+import datetime
+import pytz
+
+logger = logging.getLogger("strategy")
 
 class InfiniteStrategy:
     def __init__(self, config):
@@ -22,6 +27,61 @@ class InfiniteStrategy:
         if pseudo_rand < fraction:
             base_qty += 1
         return base_qty
+
+    # 🛡️ [V23.12 패치] VWAP 시장 미시구조 거래량 지배력 분석 엔진
+    def analyze_vwap_dominance(self, df):
+        """
+        1분봉 데이터프레임을 받아 당일 VWAP 지배력을 연산합니다.
+        """
+        if df is None or (isinstance(df, pd.DataFrame) and len(df) < 10):
+            return {"vwap_price": 0.0, "is_strong_up": False, "is_strong_down": False}
+            
+        try:
+            # 대표 가격 (Typical Price) 산출
+            if 'High' in df.columns and 'Low' in df.columns:
+                typical_price = (df['High'] + df['Low'] + df['Close']) / 3.0
+            else:
+                typical_price = df['Close']
+                
+            vol_x_price = typical_price * df['Volume']
+            total_vol = df['Volume'].sum()
+            
+            if total_vol == 0: return {"vwap_price": 0.0, "is_strong_up": False, "is_strong_down": False}
+                
+            vwap_price = vol_x_price.sum() / total_vol
+            
+            # 누적 VWAP 기울기 (Slope)
+            df_temp = pd.DataFrame()
+            df_temp['Volume'] = df['Volume']
+            df_temp['Vol_x_Price'] = vol_x_price
+            df_temp['Cum_Vol'] = df_temp['Volume'].cumsum()
+            df_temp['Cum_Vol_Price'] = df_temp['Vol_x_Price'].cumsum()
+            df_temp['Running_VWAP'] = df_temp['Cum_Vol_Price'] / df_temp['Cum_Vol']
+            
+            idx_10pct = int(len(df_temp) * 0.1)
+            vwap_start = df_temp['Running_VWAP'].iloc[idx_10pct]
+            vwap_end = df_temp['Running_VWAP'].iloc[-1]
+            vwap_slope = vwap_end - vwap_start
+            
+            # 거래량 지배력 (VWAP 위/아래 체결 비중)
+            vol_above = df[df['Close'] > vwap_price]['Volume'].sum()
+            vol_above_pct = vol_above / total_vol if total_vol > 0 else 0
+            
+            daily_open = df['Open'].iloc[0] if 'Open' in df.columns else df['Close'].iloc[0]
+            daily_close = df['Close'].iloc[-1]
+            
+            is_strong_up = (daily_close > daily_open) and (vwap_slope > 0) and (vol_above_pct > 0.55)
+            is_strong_down = (daily_close < daily_open) and (vwap_slope < 0) and (vol_above_pct < 0.45)
+            
+            return {
+                "vwap_price": round(vwap_price, 2),
+                "is_strong_up": bool(is_strong_up),
+                "is_strong_down": bool(is_strong_down),
+                "vol_above_pct": round(vol_above_pct, 4)
+            }
+        except Exception as e:
+            logger.error(f"VWAP 분석 오류: {e}")
+            return {"vwap_price": 0.0, "is_strong_up": False, "is_strong_down": False}
 
     # 🛡️ [V18.13 패치] KIS 자전거래(Wash-Trade) 원천 차단 방어벽 엔진
     def _apply_wash_trade_shield(self, c_orders, b_orders, sc_orders, sb_orders):
@@ -69,8 +129,8 @@ class InfiniteStrategy:
         # V14는 사용자 요청에 따라 평단(Avg)에서 1.0 분량 집중 매수하여 방어력 확보
         qty = self._get_smart_qty(dynamic_one_portion, p_avg) if can_buy else 0
         
-        slots["slot_1"] = {"side": "BUY", "price": p_avg, "qty": qty, "type": "LOC", "desc": "[1차] V14:평단매수", "slot_id": 1}
-        slots["slot_2"] = {"side": "BUY", "price": 0, "qty": 0, "type": "LOC", "desc": "-", "slot_id": 2}
+        slots["slot_1"] = {"side": "BUY", "price": p_avg, "qty": qty, "type": "LOC", "desc": "[1차] V14:평단집중", "slot_id": 1}
+        slots["slot_2"] = {"side": "BUY", "price": 0, "qty": 0, "type": "LOC", "desc": "[2차] 가변보류(Bypass)", "slot_id": 2}
         
         return slots
 
@@ -82,8 +142,6 @@ class InfiniteStrategy:
         dynamic_one_portion = available_cash / remaining_splits if remaining_splits > 0 else 0
         
         # 🎯 [V24 Core] Shadow Price 산출
-        # Shadow Price = Day Low * (1 + Bounce%)
-        # Final limit = min(Avg Price * 1.05, Shadow Price)
         bounce_ratio = (bounce_pct / 100.0) if bounce_pct > 0 else 0.015
         shadow_p = day_low * (1 + bounce_ratio) if day_low > 0 else avg_price
         
@@ -137,14 +195,17 @@ class InfiniteStrategy:
         return {"side": "BUY", "price": turbo_price, "qty": turbo_qty, "type": "LOC", "desc": "[3차] 전술매수(Turbo)", "slot_id": 3}
 
     # 🛠 [Tactic] Jup-Jup Grid - 자투리 현금 거미줄 매수
-    def _apply_tactic_jupjup(self, avg_price, one_portion_amt, can_buy):
+    def _apply_tactic_jupjup(self, avg_price, one_portion_amt, can_buy, density=10):
         base_qty = self._get_smart_qty(one_portion_amt, avg_price)
         orders = []
-        for i in range(1, 3): # 슬롯 고정 위해 최대 2개만
-            jup_price = self._floor(one_portion_amt / (base_qty + i))
+        # [V33.1] 설정된 밀도(density)만큼 거미줄 주문 생성
+        for i in range(1, density + 1):
+            # 간격: 평단 대비 약 0.5%씩 하락하며 배치 (밀도에 따라 조정 가능)
+            price_step = 1.0 - (0.005 * i)
+            jup_price = self._floor(avg_price * price_step)
             safe_jup_p = max(0.01, round(min(jup_price, avg_price - 0.01), 2))
             q = 1 if can_buy else 0
-            orders.append({"side": "BUY", "price": safe_jup_p, "qty": q, "type": "LOC", "desc": f"[3차] 전술매수(줍줍{i})", "slot_id": 3})
+            orders.append({"side": "BUY", "price": safe_jup_p, "qty": q, "type": "LOC", "desc": f"[3차] 전술매칭(줍줍{i})", "slot_id": 3})
         return orders
 
     # 🛠 [V29.0 Tactic] Elastic Snap-back - 이격도(PEI) 기반 과매도 역발상 매수
@@ -189,8 +250,8 @@ class InfiniteStrategy:
             "slot_1": {"desc": f"[1차] {version}:평단매수", "price": 0, "qty": 0, "status": "WAITING", "side": "BUY", "result": ""},
             "slot_2": {"desc": f"[2차] {version}:보조매수", "price": 0, "qty": 0, "status": "WAITING", "side": "BUY", "result": ""},
             "slot_3": {"desc": f"[3차] {version}:전술매수", "price": 0, "qty": 0, "status": "WAITING", "side": "BUY", "result": ""},
-            "slot_4": {"desc": f"[4차] {version}:익절매도", "price": 0, "qty": 0, "status": "WAITING", "side": "SELL", "result": ""},
-            "slot_5": {"desc": f"[5차] {version}:목표매도", "price": 0, "qty": 0, "status": "WAITING", "side": "SELL", "result": ""}
+            "slot_4": {"desc": f"[4차] {version}:익절대기", "price": 0, "qty": 0, "status": "WAITING", "side": "SELL", "result": ""},
+            "slot_5": {"desc": f"[5차] {version}:목표대기", "price": 0, "qty": 0, "status": "WAITING", "side": "SELL", "result": ""}
         }
 
     def get_plan(self, ticker, current_price, avg_price, qty, prev_close, 
@@ -222,6 +283,33 @@ class InfiniteStrategy:
         
         base_price = current_price if current_price > 0 else prev_close
         if base_price <= 0: return {"orders": [], "process_status": "⛔가격오류", "slots": plan_slots}
+
+        # ──────────────────────────────────────────────
+        # [V-REV] 역추세 리버스 상태 및 지능형 필터 확인
+        # ──────────────────────────────────────────────
+        is_reverse = tactics_config.get("is_reverse", False)
+        rev_day = tactics_config.get("rev_day", self.cfg.get_rev_day())
+        
+        vix = tactics_config.get("_vix", 20.0) # 외부에서 공급받는 VIX (없으면 20.0)
+        spy_trend = tactics_config.get("_spy_trend", "BULL")
+        vwap_df = tactics_config.get("vwap_df", None)
+        
+        # VWAP 지배력 분석
+        vwap_info = self.analyze_vwap_dominance(vwap_df) if tactics_config.get("vwap_dominance", False) else {}
+        is_strong_up = vwap_info.get("is_strong_up", False)
+
+        # [Tactic] TREND FILTER
+        trend_blocked = (tactics_config.get("trend_filter", False) and spy_trend == "BEAR")
+
+        # [Tactic] VIX-AWARE SIZING
+        vix_multiplier = 1.0
+        if tactics_config.get("vix_aware", False):
+            if vix >= 45: vix_multiplier = 0.0
+            elif vix >= 35: vix_multiplier = 0.4
+            elif vix >= 25: vix_multiplier = 0.7
+
+        if vix_multiplier == 0.0 and tactics_config.get("vix_aware", False):
+            return {"orders": [], "process_status": f"🚨VIX={vix:.1f} 전면 매수차단", "slots": plan_slots}
 
         # 1. 전술: [The Shield] 가변 분할 적용
         dynamic_split = split
@@ -285,29 +373,52 @@ class InfiniteStrategy:
             for k, v in base_slots.items():
                 plan_slots[k].update(v)
 
-        # 4. 전술(Tactics) 슬롯 할당 (Slot 3)
+        # 4. 전술(Tactics) 슬롯 할당 (Slot 3) 및 다중 전술 수집
+        tactical_orders = []
         if not is_v4_reverse:
-            if tactics_config.get("elastic", False): # [V29.0] Elastic 우선 적용
+            # [V33.1] 모든 활성 전술을 독립적으로 평가하여 중복 허용
+            # 1) Elastic
+            if tactics_config.get("elastic", False):
                 e_order = self._apply_tactic_elastic(current_price, avg_price, ma_5day, pei_val, one_portion_amt, can_buy)
-                if e_order: plan_slots["slot_3"].update(e_order)
+                if e_order: tactical_orders.append(e_order)
             
-            if not plan_slots["slot_3"].get('qty'): # Elastic/Sniper 미발동 시 기존 전술
-                if tactics_config.get("sniper", False): # [V29.7] Sniper 격발 체크
-                    s_drop = tactics_config.get("sniper_drop", 1.5)
-                    s_order = self._apply_tactic_sniper(current_price, avg_price, day_high, s_drop, qty)
-                    if s_order: plan_slots["slot_3"].update(s_order)
+            # 2) Sniper (상방 스나이퍼 격발)
+            if tactics_config.get("sniper", False):
+                s_drop = tactics_config.get("sniper_drop", self.cfg.get_sniper_drop())
+                s_order = self._apply_tactic_sniper(current_price, avg_price, day_high, s_drop, qty)
+                if s_order: tactical_orders.append(s_order)
                 
-                if not plan_slots["slot_3"].get('qty'): # 스나이퍼 미격발 시 하위 전술 감시
-                    if tactics_config.get("shadow", False):
-                        plan_slots["slot_3"].update(self._apply_tactic_shadow(avg_price, day_low, base_price, one_portion_amt, can_buy))
-                    elif tactics_config.get("turbo", False):
-                        plan_slots["slot_3"].update(self._apply_tactic_turbo(avg_price, prev_close, safe_ceiling, one_portion_amt, can_buy))
-                    elif tactics_config.get("jupjup", False):
-                        j_orders = self._apply_tactic_jupjup(avg_price, one_portion_amt, can_buy)
-                        if j_orders: plan_slots["slot_3"].update(j_orders[0])
+            # 3) Shadow (V24가 아닐 때만 독립 전술로 동작)
+            if tactics_config.get("shadow", False) and version != "V24":
+                shadow_order = self._apply_tactic_shadow(avg_price, day_low, base_price, one_portion_amt, can_buy)
+                if shadow_order: tactical_orders.append(shadow_order)
+                
+            # 4) Turbo
+            if tactics_config.get("turbo", False):
+                turbo_order = self._apply_tactic_turbo(avg_price, prev_close, safe_ceiling, one_portion_amt, can_buy)
+                if turbo_order: tactical_orders.append(turbo_order)
+                
+            # 5) JupJup (거미줄)
+            if tactics_config.get("jupjup", False):
+                j_density = tactics_config.get("jupjup_density", self.cfg.get_jupjup_density())
+                j_orders = self._apply_tactic_jupjup(avg_price, one_portion_amt, can_buy, j_density)
+                if j_orders: tactical_orders.extend(j_orders)
+
+            # Slot 3 UI 표시: 여러 전술 중 가장 중요도가 높은 하나를 대표로 표시 (UI 레이아웃 유지)
+            if tactical_orders:
+                # 주문 리스트 중 첫 번째(우선순위: Elastic > Sniper > ...)를 슬롯3에 매칭
+                # (orders 리스트에는 append된 모든 주문이 담김)
+                plan_slots["slot_3"].update(tactical_orders[0])
+                if len(tactical_orders) > 1:
+                    plan_slots["slot_3"]["desc"] = f"[3차] 다중전술({len(tactical_orders)}건)"
 
         # 5. 매도 로직 슬롯 할당 (Slot 4, 5)
-        if qty > 0 and not is_v4_reverse:
+        # 🛡️ [V26.9] 당일 보호 원칙: 오늘 매수한 종목은 목표가에 상관없이 졸업(전량매도)하지 않음 (최소 1박 숙성 보장)
+        today_str = datetime.datetime.now(pytz.timezone('Asia/Seoul')).strftime('%Y-%m-%d')
+        last_buy_date = self.cfg.get_last_split_date(ticker)
+        is_protected_today = (last_buy_date == today_str)
+
+        if qty > 0 and not is_v4_reverse and not is_protected_today:
             q_qty = math.ceil(qty / 4)
             rem_qty = qty - q_qty
             if tactics_config.get("sniper", False) or version == "V24":
@@ -316,16 +427,78 @@ class InfiniteStrategy:
                 if target_price > 0:
                     plan_slots["slot_5"].update({"side": "SELL", "price": target_price, "qty": rem_qty, "type": "LIMIT", "desc": f"[5차] {version}:목표매도", "slot_id": 5})
             else:
+                # 스나이퍼 미사용 클래식 모드: 5차에 전량 할당
                 if target_price > 0:
-                    plan_slots["slot_5"].update({"side": "SELL", "price": target_price, "qty": qty, "type": "LIMIT", "desc": f"[5차] {version}:목표매도", "slot_id": 5})
+                    plan_slots["slot_4"].update({"desc": f"[4차] {version}:익절보류", "price": 0, "qty": 0})
+                    plan_slots["slot_5"].update({"side": "SELL", "price": target_price, "qty": qty, "type": "LIMIT", "desc": f"[5차] {version}:전량목표매도", "slot_id": 5})
+        elif is_protected_today and qty > 0:
+            logging.info(f"🛡️ [{ticker}] 당일 매수 보호 중 (최소 1박 숙성 원칙). 익절 주문을 대기합니다.")
 
         # 6. 실 주문 리스트 생성
-        all_orders = [o for k, o in plan_slots.items() if o.get('qty', 0) > 0]
+        all_orders = [o for k, o in plan_slots.items() if o.get('qty', 0) > 0 and k != "slot_3"]
+        # 슬롯3 대신 수집된 tactical_orders 전체를 실제 주문에 포함
+        all_orders.extend([o for o in tactical_orders if o.get('qty', 0) > 0])
         
+        # 🔄 [V-REV] 리버스 순환 매매 로직 오버라이드 (최우선 순위)
+        if is_reverse:
+            # 프리마켓(PRE_CHECK) 단계에서는 실제 주문을 내지 않고 상태만 표시하여 스케줄 장애 방지
+            is_active_trading_time = (market_type == "REG")
+            
+            all_orders = []
+            process_status = f"🔄리버스({rev_day}일차)"
+            
+            # 리버스 시에는 물량을 작게 나누어 순환 (평균 1/20)
+            rev_sell_qty = max(1, math.floor(qty / 20)) if qty >= 1 else 0
+            if rev_day == 1:
+                # 1일차: 시장가 또는 MOC로 의무적 물량 덜어내기
+                if rev_sell_qty > 0 and is_active_trading_time:
+                    all_orders.append({"side": "SELL", "price": base_price, "qty": rev_sell_qty, "type": "LOC", "desc": "🚨리버스(의무매도)", "slot_id": 4})
+            else:
+                # 2일차 이후: 평단가(또는 MA5) 부근에서 매도와 매수 동시 배치 (Zero-Reverse 고도화)
+                star_p = round(ma_5day, 2) if ma_5day > 0 else round(avg_price, 2)
+                if rev_sell_qty > 0 and is_active_trading_time:
+                    all_orders.append({"side": "SELL", "price": star_p, "qty": rev_sell_qty, "type": "LOC", "desc": "🌟리버스별값매도", "slot_id": 4})
+                
+                # 매수: 별값 바로 아래에서 1회분 매수 대기
+                buy_price = round(star_p - 0.01, 2)
+                buy_qty = self._get_smart_qty(one_portion_amt, buy_price) if (can_buy and buy_price > 0) else 0
+                if buy_qty > 0 and is_active_trading_time:
+                    all_orders.append({"side": "BUY", "price": buy_price, "qty": buy_qty, "type": "LOC", "desc": "⚓리버스평단매수", "slot_id": 1})
+            
+            # 리버스 시에는 전용 슬롯만 갱신하여 반환
+            plan_slots = self._get_empty_slots("REV")
+            for o in all_orders:
+                sid = f"slot_{o.get('slot_id', 1)}"
+                if sid in plan_slots: plan_slots[sid].update(o)
+            
+            return {
+                "orders": all_orders, "slots": plan_slots, "process_status": process_status,
+                "t_val": t_val, "split": split, "dynamic_split": dynamic_split, "version": "REV"
+            }
+
+        # 🛡️ 지능형 필터링 레이어링 (BUY 주문 보정)
+        final_orders = []
+        for order in all_orders:
+            if order.get("side") == "BUY":
+                # FOMO 차단
+                if is_strong_up and tactics_config.get("vwap_dominance", False):
+                    process_status += " | ⛔VWAP-FOMO 차단"
+                    continue
+                # 트렌드 차단
+                if trend_blocked and order.get("slot_id") == 1:
+                    process_status += " | 🔻TREND-BEAR 차단"
+                    continue
+                # VIX 비중 조절
+                if tactics_config.get("vix_aware", False) and vix_multiplier < 1.0:
+                    order["qty"] = max(1, math.floor(order.get("qty", 0) * vix_multiplier))
+                    process_status += f" | ⚡VIX조절({int(vix_multiplier*100)}%)"
+            
+            final_orders.append(order)
+
         v4_star_price = rev_star_price if is_v4_reverse else star_price
         
         return {
-            "orders": all_orders,
+            "orders": final_orders,
             "slots": plan_slots,
             "t_val": t_val, "split": split, "dynamic_split": dynamic_split, 
             "one_portion": one_portion_amt, "process_status": process_status,

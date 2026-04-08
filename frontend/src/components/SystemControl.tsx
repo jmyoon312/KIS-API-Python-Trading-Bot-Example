@@ -14,7 +14,11 @@ export default function SystemControl({ mode }: { mode: 'mock' | 'real' }) {
     shadow: false,
     turbo: false,
     sniper: true,
-    jupjup: false
+    jupjup: false,
+    is_reverse: false,
+    vix_aware: true,
+    trend_filter: false,
+    vwap_dominance: false
   })
   
   // 🔍 [V33 Search]
@@ -86,17 +90,22 @@ export default function SystemControl({ mode }: { mode: 'mock' | 'real' }) {
   }
 
   const handleStrategyChange = async (key: string, value: any, label: string) => {
+    // [V25.2] 즉각적인 UI 반영을 위해 로컬 상태 선반영
+    setTactics((prev: any) => ({ ...prev, [key]: value }))
+    
     try {
       if (key === 'version') setEngineVersion(value)
 
       await api.post('/settings/global-strategy', { mode, key, value })
       setStatusMsg(`✅ ${label} 변경 완료`)
       
-      // [V25] 전술 상태 동기 유지
-      setTactics((prev: any) => ({ ...prev, [key]: value }))
-      
+      // 저장 후 최신 서버 상태로 최종 싱크
+      await fetchData()
+    } catch { 
+      setStatusMsg(`❌ ${label} 변경 실패`) 
+      // 실패 시 원래 데이터로 복구 위해 다시 로드
       fetchData()
-    } catch { setStatusMsg(`❌ ${label} 변경 실패`) }
+    }
     setTimeout(() => setStatusMsg(''), 3000)
   }
 
@@ -349,6 +358,48 @@ export default function SystemControl({ mode }: { mode: 'mock' | 'real' }) {
             </div>
             <button onClick={() => handleStrategyChange('jupjup', !tactics.jupjup, '줍줍 거미줄')} className={`w-10 h-5 rounded-full relative transition-colors ${tactics.jupjup ? 'bg-yellow-600' : 'bg-[#27272a]'}`}>
               <div className={`w-3 h-3 rounded-full bg-white absolute top-1 transition-transform ${tactics.jupjup ? 'translate-x-6' : 'translate-x-1'}`}></div>
+            </button>
+          </div>
+
+          {/* [탈출] V-REV 리버스 모드 */}
+          <div className={`p-4 rounded-xl border transition-all flex justify-between items-center ${tactics.is_reverse ? 'bg-purple-900/10 border-purple-500/40 shadow-[0_0_15px_rgba(168,85,247,0.1)]' : 'bg-[#18181b] border-[#27272a]'}`}>
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-bold text-white">🔄 V-REV 리버스 모드</span>
+                {tactics.is_reverse && <span className="animate-pulse w-1.5 h-1.5 rounded-full bg-purple-500 shadow-[0_0_8px_rgba(168,85,247,0.8)]"></span>}
+              </div>
+              <p className="text-[0.6rem] text-gray-500 mt-0.5">평단가 부근 순환 매매 탈출 전술</p>
+            </div>
+            <button onClick={() => handleStrategyChange('is_reverse', !tactics.is_reverse, 'V-REV 리버스 모드')} className={`w-10 h-5 rounded-full relative transition-colors ${tactics.is_reverse ? 'bg-purple-600' : 'bg-[#27272a]'}`}>
+              <div className={`w-3 h-3 rounded-full bg-white absolute top-1 transition-transform ${tactics.is_reverse ? 'translate-x-6' : 'translate-x-1'}`}></div>
+            </button>
+          </div>
+
+          {/* [보조] VIX-Aware Sizing */}
+          <div className={`p-4 rounded-xl border transition-all flex justify-between items-center ${tactics.vix_aware ? 'bg-blue-900/10 border-blue-500/40 shadow-[0_0_15px_rgba(59,130,246,0.1)]' : 'bg-[#18181b] border-[#27272a]'}`}>
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-bold text-white">⚡ VIX-Aware 수량 조절</span>
+                {tactics.vix_aware && <span className="animate-pulse w-1.5 h-1.5 rounded-full bg-blue-500 shadow-[0_0_8px_rgba(59,130,246,0.8)]"></span>}
+              </div>
+              <p className="text-[0.6rem] text-gray-500 mt-0.5">변동성 기반 매수 물량 자동 최적화</p>
+            </div>
+            <button onClick={() => handleStrategyChange('vix_aware', !tactics.vix_aware, 'VIX-Aware 조절')} className={`w-10 h-5 rounded-full relative transition-colors ${tactics.vix_aware ? 'bg-blue-600' : 'bg-[#27272a]'}`}>
+              <div className={`w-3 h-3 rounded-full bg-white absolute top-1 transition-transform ${tactics.vix_aware ? 'translate-x-6' : 'translate-x-1'}`}></div>
+            </button>
+          </div>
+
+          {/* [보조] VWAP Dominance 분석 */}
+          <div className={`p-4 rounded-xl border transition-all flex justify-between items-center ${tactics.vwap_dominance ? 'bg-orange-900/10 border-orange-500/40 shadow-[0_0_15px_rgba(249,115,22,0.1)]' : 'bg-[#18181b] border-[#27272a]'}`}>
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-bold text-white">📊 VWAP 지배력 분석</span>
+                {tactics.vwap_dominance && <span className="animate-pulse w-1.5 h-1.5 rounded-full bg-orange-500 shadow-[0_0_8px_rgba(249,115,22,0.8)]"></span>}
+              </div>
+              <p className="text-[0.6rem] text-gray-500 mt-0.5">거래량 기반 FOMO 및 추격 매수 방어</p>
+            </div>
+            <button onClick={() => handleStrategyChange('vwap_dominance', !tactics.vwap_dominance, 'VWAP 분석')} className={`w-10 h-5 rounded-full relative transition-colors ${tactics.vwap_dominance ? 'bg-orange-600' : 'bg-[#27272a]'}`}>
+              <div className={`w-3 h-3 rounded-full bg-white absolute top-1 transition-transform ${tactics.vwap_dominance ? 'translate-x-6' : 'translate-x-1'}`}></div>
             </button>
           </div>
         </div>

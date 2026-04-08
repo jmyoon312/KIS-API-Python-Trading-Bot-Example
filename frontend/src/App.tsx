@@ -4,10 +4,12 @@ import SystemControl from './components/SystemControl'
 import PerformanceAnalytics from './components/PerformanceAnalytics'
 import LedgerExplorer from './components/LedgerExplorer'
 import SimulationTestbed from './components/SimulationTestbed'
+import VRevAdvancedResearch from './components/VRevAdvancedResearch'
+import StrategyGuide from './components/StrategyGuide'
 import Login from './components/Login'
 import { Toaster } from 'react-hot-toast'
 
-type TabKey = 'terminal' | 'system' | 'ledger' | 'archive' | 'simulator'
+type TabKey = 'terminal' | 'system' | 'ledger' | 'archive' | 'simulator' | 'vrev' | 'guide'
 
 const TABS: { key: TabKey; icon: string; label: string }[] = [
   { key: 'terminal',  icon: '💻', label: '상황실' },
@@ -15,6 +17,8 @@ const TABS: { key: TabKey; icon: string; label: string }[] = [
   { key: 'ledger',    icon: '📒', label: '장부' },
   { key: 'archive',   icon: '📊', label: '분석' },
   { key: 'simulator', icon: '🧪', label: '연구소' },
+  { key: 'vrev',      icon: '⚡', label: 'V-REV' },
+  { key: 'guide',     icon: '📖', label: '백서' },
 ]
 
 function App() {
@@ -54,11 +58,11 @@ function App() {
                 setActiveMode(next)
                 localStorage.setItem('inf_mode', next)
               }}
-              className={`text-[0.65rem] font-bold px-2 py-1 rounded-full border transition-all ${
+              className={`text-[0.65rem] font-extrabold px-3 py-1.5 rounded-xl border transition-all duration-300 ${
                 activeMode === 'real' 
-                ? 'border-blue-500 text-blue-400 bg-blue-900/40 shadow-[0_0_10px_rgba(59,130,246,0.5)]' 
-                : 'border-emerald-500 text-emerald-400 bg-emerald-900/40'
-              }`}
+                ? 'border-blue-500/50 text-blue-400 bg-blue-500/10 shadow-[0_0_15px_rgba(59,130,246,0.2)]' 
+                : 'border-emerald-500/50 text-emerald-400 bg-emerald-500/10 shadow-[0_0_15px_rgba(16,185,129,0.2)]'
+              } active:scale-95`}
             >
               {activeMode === 'real' ? '🚀 REAL' : '🧪 MOCK'}
             </button>
@@ -66,16 +70,16 @@ function App() {
             {/* Auto refresh toggle */}
             <button 
               onClick={() => setIsAutoRefresh(!isAutoRefresh)}
-              className={`flex items-center gap-1.5 text-[0.65rem] font-bold px-2 py-1 rounded-full border transition-all ${
+              className={`flex items-center gap-2 text-[0.65rem] font-extrabold px-3 py-1.5 rounded-xl border transition-all duration-300 ${
                 isAutoRefresh 
-                ? (activeMode === 'real' ? 'border-blue-500/50 text-blue-400 bg-blue-900/20' : 'border-emerald-500/50 text-emerald-400 bg-emerald-900/20') 
-                : 'border-[#3f3f46] text-gray-500 bg-transparent'
-              }`}
+                ? (activeMode === 'real' ? 'border-blue-500/30 text-blue-400 bg-blue-500/5' : 'border-emerald-500/30 text-emerald-400 bg-emerald-500/5') 
+                : 'border-[#27272a] text-gray-500 bg-transparent'
+              } active:scale-95`}
             >
               <span className={`w-1.5 h-1.5 rounded-full ${
                 isAutoRefresh 
-                ? (activeMode === 'real' ? 'bg-blue-500 animate-pulse' : 'bg-emerald-500 animate-pulse') 
-                : 'bg-gray-600'
+                ? (activeMode === 'real' ? 'bg-blue-500 animate-pulse box-shadow-[0_0_8px_rgba(59,130,246,0.8)]' : 'bg-emerald-500 animate-pulse box-shadow-[0_0_8px_rgba(16,185,129,0.8)]') 
+                : 'bg-gray-700'
               }`}></span>
               LIVE
             </button>
@@ -119,6 +123,8 @@ function App() {
         {activeTab === 'ledger' && <LedgerExplorer mode={activeMode} />}
         {activeTab === 'archive' && <PerformanceAnalytics mode={activeMode} />}
         {activeTab === 'simulator' && <SimulationTestbed />}
+        {activeTab === 'vrev' && <VRevAdvancedResearch />}
+        {activeTab === 'guide' && <StrategyGuide />}
       </main>
 
       <Toaster 

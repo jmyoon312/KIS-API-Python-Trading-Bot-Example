@@ -92,6 +92,16 @@ const SimulationTestbed = () => {
   const [useSniper, setUseSniper] = useState(true)
   const [useEmergency, setUseEmergency] = useState(true)
   const [useJupjup, setUseJupjup] = useState(false)
+  // [V3 Lab] 하락장 방어 실험전술
+  const [useVShield, setUseVShield] = useState(false)
+  const [useMicroBounce, setUseMicroBounce] = useState(false)
+  const [useSmartJup, setUseSmartJup] = useState(false)
+  // [V4 Lab] 차세대 실험 전술
+  const [useTrendFilter, setUseTrendFilter] = useState(false)
+  const [useVixAware, setUseVixAware] = useState(false)
+  const [useVolHarvest, setUseVolHarvest] = useState(false)
+  const [useVwapDominance, setUseVwapDominance] = useState(false)
+  const [useVRev, setUseVRev] = useState(false)
   
   // 🛡️ [V29.7] Precision Lab Extensions
   const [resolution, setResolution] = useState<'1D' | '1M'>('1D')
@@ -143,6 +153,14 @@ const SimulationTestbed = () => {
         use_sniper: useSniper,
         use_emergency: useEmergency,
         use_jupjup: useJupjup,
+        use_v_shield: useVShield,
+        use_micro_bounce: useMicroBounce,
+        use_smart_jup: useSmartJup,
+        use_trend_filter: useTrendFilter,
+        use_vix_aware: useVixAware,
+        use_vol_harvest: useVolHarvest,
+        use_vwap_dominance: useVwapDominance,
+        use_v_rev: useVRev,
         sniper_drop: sniperDrop
       })
 
@@ -385,6 +403,22 @@ const SimulationTestbed = () => {
                    <ToggleSwitch active={useEmergency} onChange={setUseEmergency} label="급락 구출" desc="패닉 복구" themeColor="bg-rose-600" />
                    <ToggleSwitch active={useJupjup} onChange={setUseJupjup} label="줍줍 거미줄" desc="하락장 매집" themeColor="bg-teal-600" />
                 </div>
+                {/* [V3 Lab] 하락장 방어 실험전술 */}
+                {resolution === '1M' && (
+                  <div className="mt-3 p-3 rounded-2xl border border-purple-500/30 bg-purple-500/5">
+                    <div className="text-[9px] font-black text-purple-400 uppercase tracking-widest mb-2">⚗️ V4 실험실 — 하락장 생존 전술 (1M/Research)</div>
+                    <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
+                      <ToggleSwitch active={useVShield} onChange={setUseVShield} label="V-Shield" desc="변동성 매수차단" themeColor="bg-purple-600" />
+                      <ToggleSwitch active={useMicroBounce} onChange={setUseMicroBounce} label="탄성 스캘핑" desc="장중 폭락 대응" themeColor="bg-violet-600" />
+                      <ToggleSwitch active={useSmartJup} onChange={setUseSmartJup} label="스마트 줍줍" desc="RSI 연동 x2" themeColor="bg-fuchsia-600" />
+                      <ToggleSwitch active={useTrendFilter} onChange={setUseTrendFilter} label="추세 필터" desc="200MA 하락장 방어" themeColor="bg-indigo-600" />
+                      <ToggleSwitch active={useVixAware} onChange={setUseVixAware} label="VIX 사이징" desc="공포지수 연동 감축" themeColor="bg-blue-600" />
+                      <ToggleSwitch active={useVolHarvest} onChange={setUseVolHarvest} label="변동성 수확" desc="일일 수익 적립/재매수" themeColor="bg-cyan-600" />
+                      <ToggleSwitch active={useVwapDominance} onChange={setUseVwapDominance} label="VWAP 지배력" desc="FOMO 방어 (1M)" themeColor="bg-fuchsia-600" />
+                      <ToggleSwitch active={useVRev} onChange={setUseVRev} label="V-REV 리버스" desc="역추세 순환 (V4)" themeColor="bg-red-600" />
+                    </div>
+                  </div>
+                )}
               </div>
            </div>
            <div className="lg:col-span-4 flex flex-col justify-between gap-4">

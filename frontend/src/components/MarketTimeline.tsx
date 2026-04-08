@@ -155,16 +155,21 @@ export default function MarketTimeline({ marketStatus, dstInfo, isSummer: propIs
       const res = await axios.get(`/api/analytics?mode=${mode}`);
       if (res.data.events) {
         // 해당 페이즈와 관련된 키워드로 필터링 (간이 필터링)
-        const taskMap: Record<string, string> = {
-          'sync': 'SYNC',
-          'pre': 'PRE',    // RESET -> PRE (to match log_event)
-          'reg': 'REG',    // TRADE -> REG (to match log_event)
-          'after': 'SNAPSHOT',
-          'idle': 'SYSTEM'
+        const taskMap: Record<string, string[]> = {
+          'sync': ['SYNC', 'SCHEDULE'],
+          'pre': ['PRE', 'RESET'],
+          'reg': ['REG', 'TRADE', 'INIT', 'MOCK-LOC'],
+          'after': ['SNAPSHOT', 'AFTER'],
+          'idle': ['SYSTEM', 'CLEANING']
         };
-        const targetTask = taskMap[item.phase] || '';
+        const targetTasks = taskMap[item.phase] || [];
+        // [V26.5] 이모지 제거 후 검색하여 매칭률 향상
+        const cleanLabel = item.label.replace(/[^\w\s가-힣]/g, '').trim();
+        
         const filtered = res.data.events.filter((ev: any) => 
-          ev.task.includes(targetTask) || ev.msg.includes(item.label)
+          targetTasks.some(t => ev.task.includes(t)) || 
+          ev.msg.includes(cleanLabel) ||
+          ev.task.includes(cleanLabel.toUpperCase())
         );
         setPhaseEvents(filtered.reverse());
       }
